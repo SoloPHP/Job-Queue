@@ -1,0 +1,44 @@
+{
+  "name": "solophp/job-queue",
+  "type": "library",
+  "description": "A modern PHP job queue built on top of Doctrine DBAL with object-oriented job handling. Supports scheduled execution, retries, job expiration, indexed job types, automatic deletion of completed jobs, and type-safe job classes.",
+  "keywords": ["php", "queue", "jobs", "scheduler", "async"],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Vitaliy Olos",
+      "email": "vedastudio@gmail.com"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "Solo\\JobQueue\\": "src/"
+    }
+  },
+  "require": {
+    "php": ">=8.2",
+    "ext-json": "*",
+    "ext-posix": "*",
+    "doctrine/dbal": "^3.0|^4.0",
+    "solophp/contracts": "dev-main@dev"
+  },
+  "require-dev": {
+    "phpstan/phpstan": "^2.0",
+    "squizlabs/php_codesniffer": "^3.13"
+  },
+  "scripts": {
+    "cs-check": "phpcs --standard=PSR12 src/",
+    "cs-fix": "phpcbf --standard=PSR12 src/",
+    "analyze": "phpstan analyze src/",
+    "test": [
+      "@cs-check",
+      "@analyze"
+    ]
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "config": {
+    "sort-packages": true,
+    "optimize-autoloader": true
+  }
+}
