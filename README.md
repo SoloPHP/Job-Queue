@@ -7,6 +7,18 @@
 A modern PHP job queue built on top of Doctrine DBAL with object-oriented job handling.
 Supports scheduled execution, retries, job expiration, indexed job types, automatic deletion of completed jobs, and type-safe job classes.
 
+## 🧰 Features
+
+- **Type-Safe Jobs** – Object-oriented job classes with `JobInterface`
+- **Job Retries** – Configurable max retry attempts before marking as failed
+- **Job Expiration** – Automatic expiration via `expires_at` timestamp
+- **Indexed Job Types** – Fast filtering by `type`
+- **Row-Level Locking** – Prevents concurrent execution of the same job
+- **Transactional Safety** – All job operations are executed within a transaction
+- **Optional Process Locking** – Prevent overlapping workers using `LockGuard`
+- **Optional Deletion on Success** – Set `deleteOnSuccess: true` to automatically delete jobs after success
+- **Dependency Injection** – Jobs can receive dependencies through constructor
+
 ## 📦 Installation
 
 ```bash
@@ -103,18 +115,6 @@ try {
     $lock->release(); // Optional, auto-released on shutdown
 }
 ```
-
-## 🧰 Features
-
-- **Type-Safe Jobs** – Object-oriented job classes with `JobInterface`
-- **Job Retries** – Configurable max retry attempts before marking as failed
-- **Job Expiration** – Automatic expiration via `expires_at` timestamp
-- **Indexed Job Types** – Fast filtering by `type`
-- **Row-Level Locking** – Prevents concurrent execution of the same job
-- **Transactional Safety** – All job operations are executed within a transaction
-- **Optional Process Locking** – Prevent overlapping workers using `LockGuard`
-- **Optional Deletion on Success** – Set `deleteOnSuccess: true` to automatically delete jobs after success
-- **Dependency Injection** – Jobs can receive dependencies through constructor
 
 ## 🔗 Integration with Async Event-Dispatcher
 

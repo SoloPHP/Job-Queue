@@ -1,7 +1,7 @@
 {
   "name": "solophp/job-queue",
   "type": "library",
-  "description": "A modern PHP job queue built on top of Doctrine DBAL with object-oriented job handling. Supports scheduled execution, retries, job expiration, indexed job types, automatic deletion of completed jobs, and type-safe job classes.",
+  "description": "A modern PHP job queue built on top of Doctrine DBAL with object-oriented job handling.",
   "keywords": ["php", "queue", "jobs", "scheduler", "async"],
   "license": "MIT",
   "authors": [
