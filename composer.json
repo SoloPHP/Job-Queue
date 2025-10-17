@@ -1,0 +1,56 @@
+{
+  "name": "solophp/job-queue",
+  "type": "library",
+  "description": "A lightweight and flexible job queue library for PHP with database-backed persistence and object-oriented job handling.",
+  "keywords": [
+    "php",
+    "queue",
+    "jobs",
+    "scheduler",
+    "async"
+  ],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Vitaliy Olos",
+      "email": "vedastudio@gmail.com"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "Solo\\JobQueue\\": "src/"
+    }
+  },
+  "require": {
+    "php": ">=8.2",
+    "ext-json": "*",
+    "doctrine/dbal": "^3.0|^4.0",
+    "solophp/contracts": "^1.0",
+    "psr/container": "^1.0|^2.0"
+  },
+  "require-dev": {
+    "phpstan/phpstan": "^2.0",
+    "squizlabs/php_codesniffer": "^3.13"
+  },
+  "suggest": {
+    "ext-posix": "Required for LockGuard process locking",
+    "psr/log": "PSR-3 logger interface for optional logging support",
+    "solophp/logger": "PSR-3 compatible logger implementation",
+    "solophp/container": "PSR-11 container implementation for dependency injection"
+  },
+  "scripts": {
+    "cs-check": "phpcs --standard=PSR12 src/",
+    "cs-fix": "phpcbf --standard=PSR12 src/",
+    "analyze": "phpstan analyse src --level=max",
+    "test": [
+      "@cs-check",
+      "@analyze"
+    ]
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "config": {
+    "sort-packages": true,
+    "optimize-autoloader": true
+  }
+}
