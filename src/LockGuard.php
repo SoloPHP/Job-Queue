@@ -5,66 +5,59 @@ declare(strict_types=1);
 namespace Solo\JobQueue;
 
 /**
- * LockGuard prevents parallel execution of a process by using a lock file.
- * Useful in cron-based task workers or long-running scripts to avoid overlaps.
+ * Prevents concurrent execution of the same worker using an exclusive file lock.
+ * The lock is atomic (flock), works cross-platform, and is auto-released by the
+ * OS when the process exits — no PID inspection, no TOCTOU race.
  */
 final class LockGuard
 {
-    /**
-     * Full path to the lock file.
-     */
-    private string $file;
+    /** @var resource|null */
+    private $handle;
 
-    /**
-     * Indicates whether the current instance owns the lock.
-     */
-    private bool $active = false;
-
-    /**
-     * @param string $file Absolute path to the lock file
-     */
-    public function __construct(string $file)
+    public function __construct(private readonly string $file)
     {
-        $this->file = $file;
     }
 
     /**
-     * Attempts to acquire the lock.
-     * If the lock file exists and the process is still running — returns false.
-     * If the lock file is stale or missing, creates a new lock.
-     *
-     * @return bool True if lock acquired, false otherwise
+     * Try to acquire the lock. Returns false if another process holds it.
      */
     public function acquire(): bool
     {
-        if (!is_dir(dirname($this->file))) {
-            mkdir(dirname($this->file), 0775, true);
+        $dir = dirname($this->file);
+        if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
+            return false;
         }
 
-        if (file_exists($this->file)) {
-            $pid = file_get_contents($this->file);
-            if ($pid && posix_kill((int)$pid, 0)) {
-                return false;
-            }
-            unlink($this->file);
+        $handle = @fopen($this->file, 'c');
+        if ($handle === false) {
+            return false;
         }
 
-        file_put_contents($this->file, getmypid());
-        $this->active = true;
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+            return false;
+        }
 
-        register_shutdown_function(fn() => $this->release());
-
+        $this->handle = $handle;
         return true;
     }
 
     /**
-     * Releases the lock by removing the lock file.
+     * Release the lock. Safe to call multiple times.
      */
     public function release(): void
     {
-        if ($this->active && file_exists($this->file)) {
-            unlink($this->file);
+        if ($this->handle === null) {
+            return;
         }
-        $this->active = false;
+
+        flock($this->handle, LOCK_UN);
+        fclose($this->handle);
+        $this->handle = null;
+    }
+
+    public function __destruct()
+    {
+        $this->release();
     }
 }

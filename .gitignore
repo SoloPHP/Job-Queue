@@ -1,10 +1,15 @@
 # Composer
 /vendor/
-composer.lock
 
 # PHPUnit
 .phpunit.cache/
 .phpunit.result.cache
+phpunit.xml
+
+# Static analysis caches
+.phpstan.cache
+.php-cs-fixer.cache
+.phpcs.cache
 
 # IDE
 .vscode/
@@ -36,7 +41,7 @@ logs/
 temp/
 tmp/
 
-# Lock files
+# Runtime locks (from LockGuard)
 *.lock
 
 # Coverage reports
