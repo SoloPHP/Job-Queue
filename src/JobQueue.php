@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Solo\JobQueue;
 
 use DateTimeImmutable;
+use DateTimeZone;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Platforms\SQLitePlatform;
+use InvalidArgumentException;
 use JsonSerializable;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
@@ -19,11 +21,17 @@ use Throwable;
 
 /**
  * Database-backed job queue with atomic claim, visibility timeout and exponential backoff.
+ *
+ * All DB timestamps are stored in UTC regardless of the PHP default timezone —
+ * use UTC for comparisons on the database side too.
  */
 final readonly class JobQueue implements JobQueueInterface
 {
     private const DATE_FORMAT = 'Y-m-d H:i:s';
     private const MAX_RETRY_DELAY = 3600;
+    private const TABLE_NAME_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/';
+
+    private DateTimeZone $utc;
 
     public function __construct(
         private Connection $connection,
@@ -35,6 +43,15 @@ final readonly class JobQueue implements JobQueueInterface
         private ?ContainerInterface $container = null,
         private ?LoggerInterface $logger = null,
     ) {
+        if (preg_match(self::TABLE_NAME_PATTERN, $this->table) !== 1) {
+            throw new InvalidArgumentException(sprintf(
+                'Invalid table name "%s". Must match %s.',
+                $this->table,
+                self::TABLE_NAME_PATTERN,
+            ));
+        }
+
+        $this->utc = new DateTimeZone('UTC');
     }
 
     /**
@@ -76,7 +93,7 @@ final readonly class JobQueue implements JobQueueInterface
             ? $payload['job_class']
             : 'unknown_job';
 
-        $scheduledAt ??= new DateTimeImmutable();
+        $scheduledAt ??= new DateTimeImmutable('now', $this->utc);
 
         $this->connection->executeStatement(
             "INSERT INTO {$this->table} (name, type, payload, scheduled_at, expires_at) "
@@ -85,8 +102,8 @@ final readonly class JobQueue implements JobQueueInterface
                 $name,
                 $type ?? 'default',
                 json_encode($payload, JSON_THROW_ON_ERROR),
-                $scheduledAt->format(self::DATE_FORMAT),
-                $expiresAt?->format(self::DATE_FORMAT),
+                $scheduledAt->setTimezone($this->utc)->format(self::DATE_FORMAT),
+                $expiresAt?->setTimezone($this->utc)->format(self::DATE_FORMAT),
             ]
         );
 
@@ -171,9 +188,13 @@ final readonly class JobQueue implements JobQueueInterface
      * Mark a job as failed. Retries are rescheduled with exponential backoff;
      * after maxRetries is reached the job is permanently marked as 'failed'.
      *
+     * Accepts a Throwable (recommended — full class/file/line captured in the
+     * DB error column and forwarded to the logger under PSR-3 'exception' key)
+     * or a plain string for manual failures.
+     *
      * @throws \Doctrine\DBAL\Exception
      */
-    public function markFailed(int $jobId, string $error = ''): void
+    public function markFailed(int $jobId, Throwable|string $error = ''): void
     {
         $current = $this->connection->fetchOne(
             "SELECT retry_count FROM {$this->table} WHERE id = ?",
@@ -184,6 +205,11 @@ final readonly class JobQueue implements JobQueueInterface
             return;
         }
 
+        $errorText = $this->formatError($error);
+        $logContext = $error instanceof Throwable
+            ? ['exception' => $error]
+            : ['error' => $errorText];
+
         $nextRetry = (int) $current + 1;
 
         if ($nextRetry >= $this->maxRetries) {
@@ -191,9 +217,9 @@ final readonly class JobQueue implements JobQueueInterface
                 "UPDATE {$this->table} "
                 . "SET status = 'failed', retry_count = ?, error = ?, locked_at = NULL "
                 . "WHERE id = ?",
-                [$nextRetry, $error, $jobId]
+                [$nextRetry, $errorText, $jobId]
             );
-            $this->log('error', 'Job permanently failed', ['id' => $jobId, 'error' => $error]);
+            $this->log('error', 'Job permanently failed', ['id' => $jobId] + $logContext);
             return;
         }
 
@@ -203,21 +229,20 @@ final readonly class JobQueue implements JobQueueInterface
             "UPDATE {$this->table} "
             . "SET status = 'pending', retry_count = ?, error = ?, locked_at = NULL, scheduled_at = ? "
             . "WHERE id = ?",
-            [$nextRetry, $error, $nextRun, $jobId]
+            [$nextRetry, $errorText, $nextRun, $jobId]
         );
 
         $this->log('warning', 'Job failed, will retry', [
-            'id'        => $jobId,
-            'retry'     => $nextRetry,
-            'next_run'  => $nextRun,
-            'error'     => $error,
-        ]);
+            'id'       => $jobId,
+            'retry'    => $nextRetry,
+            'next_run' => $nextRun,
+        ] + $logContext);
     }
 
     /**
      * Atomically claim up to $limit pending jobs.
      *
-     * @return array<int, array<string, mixed>>
+     * @return list<array{id: int, name: string, payload: string}>
      */
     private function claim(int $limit, ?string $type): array
     {
@@ -262,14 +287,29 @@ final readonly class JobQueue implements JobQueueInterface
                 [ParameterType::STRING, ArrayParameterType::INTEGER]
             );
 
-            /** @var array<int, array<string, mixed>> $rows */
             $rows = $conn->fetchAllAssociative(
                 "SELECT id, name, payload FROM {$this->table} WHERE id IN (?) ORDER BY scheduled_at",
                 [$ids],
                 [ArrayParameterType::INTEGER]
             );
 
-            return $rows;
+            // Normalize driver-specific types: MySQL PDO returns stringified ints,
+            // SQLite returns native ints. Narrow both to a guaranteed shape.
+            $claimed = [];
+            foreach ($rows as $row) {
+                $rawId = $row['id'] ?? null;
+                $rawName = $row['name'] ?? null;
+                $rawPayload = $row['payload'] ?? null;
+                if (!is_numeric($rawId) || !is_scalar($rawName) || !is_string($rawPayload)) {
+                    continue;
+                }
+                $claimed[] = [
+                    'id'      => (int) $rawId,
+                    'name'    => (string) $rawName,
+                    'payload' => $rawPayload,
+                ];
+            }
+            return $claimed;
         });
     }
 
@@ -279,7 +319,7 @@ final readonly class JobQueue implements JobQueueInterface
      */
     private function reclaimStuck(): void
     {
-        $staleBefore = (new DateTimeImmutable())
+        $staleBefore = (new DateTimeImmutable('now', $this->utc))
             ->modify("-{$this->lockTimeout} seconds")
             ->format(self::DATE_FORMAT);
 
@@ -323,30 +363,25 @@ final readonly class JobQueue implements JobQueueInterface
     }
 
     /**
-     * @param array<string, mixed> $job
+     * @param array{id: int, name: string, payload: string} $job
+     *
+     * @throws \Doctrine\DBAL\Exception
      */
     private function run(array $job): void
     {
-        $rawId      = $job['id']      ?? null;
-        $rawPayload = $job['payload'] ?? null;
-
-        if (!is_numeric($rawId) || !is_string($rawPayload)) {
-            return;
-        }
-
-        $id = (int) $rawId;
+        $id = $job['id'];
 
         try {
-            $instance = $this->instantiate($rawPayload);
+            $instance = $this->instantiate($job['payload']);
             $this->log('info', 'Running job', ['id' => $id, 'class' => $instance::class]);
             $instance->handle();
             $this->markCompleted($id);
         } catch (Throwable $e) {
             $this->log('error', 'Job threw exception', [
-                'id'    => $id,
-                'error' => $e->getMessage(),
+                'id'        => $id,
+                'exception' => $e,
             ]);
-            $this->markFailed($id, $e->getMessage());
+            $this->markFailed($id, $e);
         }
     }
 
@@ -397,14 +432,14 @@ final readonly class JobQueue implements JobQueueInterface
     private function backoffAt(int $retry): string
     {
         $delay = min($this->baseRetryDelay * (2 ** $retry), self::MAX_RETRY_DELAY);
-        return (new DateTimeImmutable())
+        return (new DateTimeImmutable('now', $this->utc))
             ->modify("+{$delay} seconds")
             ->format(self::DATE_FORMAT);
     }
 
     private function now(): string
     {
-        return (new DateTimeImmutable())->format(self::DATE_FORMAT);
+        return (new DateTimeImmutable('now', $this->utc))->format(self::DATE_FORMAT);
     }
 
     private function isSqlite(): bool
@@ -418,5 +453,25 @@ final readonly class JobQueue implements JobQueueInterface
     private function log(string $level, string $message, array $context = []): void
     {
         $this->logger?->log($level, $message, $context);
+    }
+
+    /**
+     * Produce a DB-storable string for the error column.
+     * Throwables render as "Class: message @ file:line" — enough for triage
+     * without requiring a structured error column.
+     */
+    private function formatError(Throwable|string $error): string
+    {
+        if (!$error instanceof Throwable) {
+            return $error;
+        }
+
+        return sprintf(
+            '%s: %s @ %s:%d',
+            $error::class,
+            $error->getMessage(),
+            $error->getFile(),
+            $error->getLine(),
+        );
     }
 }

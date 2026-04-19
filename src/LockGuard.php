@@ -24,7 +24,7 @@ final class LockGuard
     public function acquire(): bool
     {
         $dir = dirname($this->file);
-        if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
+        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
             return false;
         }
 

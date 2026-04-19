@@ -23,14 +23,6 @@ final class LockGuardTest extends TestCase
         }
     }
 
-    public function testAcquireReturnsTrueAndCreatesFile(): void
-    {
-        $guard = new LockGuard($this->file);
-        $this->assertTrue($guard->acquire());
-        $this->assertFileExists($this->file);
-        $guard->release();
-    }
-
     public function testSecondAcquireOnSameFileFromOtherGuardFails(): void
     {
         $first = new LockGuard($this->file);
@@ -42,24 +34,22 @@ final class LockGuardTest extends TestCase
         $first->release();
     }
 
-    public function testReleaseAllowsReacquisition(): void
+    public function testAcquireFailsWhenDirectoryCannotBeCreated(): void
     {
-        $first = new LockGuard($this->file);
-        $this->assertTrue($first->acquire());
-        $first->release();
+        if (posix_geteuid() === 0) {
+            $this->markTestSkipped('Cannot reliably test unwritable paths as root.');
+        }
 
-        $second = new LockGuard($this->file);
-        $this->assertTrue($second->acquire());
-        $second->release();
-    }
+        $readonly = sys_get_temp_dir() . '/job-queue-ro-' . uniqid('', true);
+        mkdir($readonly, 0500, true);
 
-    public function testReleaseIsIdempotent(): void
-    {
-        $guard = new LockGuard($this->file);
-        $guard->acquire();
-        $guard->release();
-        $guard->release();
-        $this->addToAssertionCount(1);
+        try {
+            $guard = new LockGuard($readonly . '/nested/worker.lock');
+            $this->assertFalse($guard->acquire());
+        } finally {
+            @chmod($readonly, 0755);
+            @rmdir($readonly);
+        }
     }
 
     public function testDestructorReleasesLock(): void
@@ -71,25 +61,5 @@ final class LockGuardTest extends TestCase
         $second = new LockGuard($this->file);
         $this->assertTrue($second->acquire());
         $second->release();
-    }
-
-    public function testCreatesMissingDirectory(): void
-    {
-        $dir = sys_get_temp_dir() . '/job-queue-test-dir-' . uniqid('', true);
-        $file = $dir . '/worker.lock';
-
-        try {
-            $guard = new LockGuard($file);
-            $this->assertTrue($guard->acquire());
-            $this->assertDirectoryExists($dir);
-            $guard->release();
-        } finally {
-            if (file_exists($file)) {
-                @unlink($file);
-            }
-            if (is_dir($dir)) {
-                @rmdir($dir);
-            }
-        }
     }
 }

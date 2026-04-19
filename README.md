@@ -15,7 +15,9 @@ Correctness-first: atomic claim, visibility timeout for dead workers, exponentia
 - **Exponential backoff** — retries are rescheduled with `baseDelay * 2^retry_count`, capped at 1 hour.
 - **No long transactions** — `handle()` runs outside any transaction, so external side-effects cannot be rolled back.
 - **Typed jobs** via `JobInterface` + PSR-11 dependency injection through `createFromContainer`.
-- **Optional PSR-3 logging**, optional `deleteOnSuccess`, optional `LockGuard` for preventing overlapping workers.
+- **UTC timestamps** — all DB times written in UTC regardless of the PHP default timezone.
+- **PSR-3 logging** with full-fidelity error context — Throwables are forwarded under the PSR-3 `exception` key (trace + previous chain preserved for structured log sinks).
+- **Optional `deleteOnSuccess`** and **`LockGuard`** for preventing overlapping workers.
 
 ## Requirements
 
@@ -129,6 +131,23 @@ What `processJobs()` does, in order:
 
 On a thrown exception the job is rescheduled with exponential backoff. After `maxRetries` attempts it becomes `failed` permanently.
 
+## Delivery semantics: at-least-once
+
+**Jobs can run more than once.** `handle()` runs outside any transaction, and `markCompleted()` is a separate statement. If a worker crashes (or the DB connection drops) *after* `handle()` succeeds but *before* `markCompleted()` finishes, the job stays `in_progress`. Once `lockTimeout` elapses, `reclaimStuck` returns it to the queue and another worker runs `handle()` again.
+
+This is the standard at-least-once guarantee. **Make every handler idempotent** — external side effects (emails sent, API calls, row inserts) must tolerate being repeated:
+
+- Use deduplication keys on outbound APIs (idempotency tokens).
+- Prefer `INSERT ... ON CONFLICT` / upserts over raw inserts.
+- For emails, check a "sent" flag before sending.
+- For financial operations, use transaction references.
+
+If you cannot make a handler idempotent, keep side effects minimal and accept the trade-off.
+
+## Timezones
+
+All internal timestamps (`scheduled_at`, `locked_at`, `expires_at`, `created_at` defaults) are written in **UTC** regardless of the PHP default timezone. Compare timestamps in UTC on the database side too. `DateTimeImmutable` arguments you pass to `push()`/`addJob()` are converted to UTC internally.
+
 ## Preventing overlapping workers
 
 Use `LockGuard` in cron-driven workers to avoid two instances of the same script running concurrently. It uses `flock()` — atomic, cross-platform, auto-released by the OS on process exit.
@@ -173,17 +192,17 @@ $queue->processJobs(10, 'async_event');
 | `processJobs(int $limit = 10, ?string $onlyType = null): void` | Reclaim stuck jobs, then claim and run pending jobs. |
 | `getPendingJobs(int $limit = 10, ?string $onlyType = null): array` | Informational read of pending jobs. Does not lock rows. |
 | `markCompleted(int $jobId): void` | Mark a job completed (or delete it if `deleteOnSuccess = true`). |
-| `markFailed(int $jobId, string $error = ''): void` | Record failure; reschedules with backoff or marks `failed` if retries exhausted. |
+| `markFailed(int $jobId, Throwable\|string $error = ''): void` | Record failure; reschedules with backoff or marks `failed` if retries exhausted. Passing a `Throwable` captures class/file/line in the DB `error` column and forwards the exception to the logger under the PSR-3 `exception` key. |
 
 ## Testing
 
 ```bash
 composer install
-composer test            # phpcs + phpstan + phpunit
+composer test            # cs-check + phpstan + phpunit
 composer test-unit       # phpunit only
 ```
 
-Tests run against SQLite in-memory, covering atomic claim, retry/backoff, visibility timeout, type filtering, expiry, DI wiring and validation branches.
+Tests run against SQLite in-memory, covering atomic claim, retry/backoff, visibility timeout, type filtering, expiry, DI wiring, validation branches and logger integration. Schema SQL for MySQL and PostgreSQL is tested via mocked connections.
 
 ## License
 
