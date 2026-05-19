@@ -24,7 +24,7 @@ Correctness-first: atomic claim, visibility timeout for dead workers, exponentia
 
 ## Requirements
 
-- PHP **>= 8.2**
+- PHP **>= 8.3**
 - `ext-json`
 - `doctrine/dbal` ^4
 - One of: MySQL 8+, MariaDB 10.6+, PostgreSQL 9.5+, SQLite 3.35+

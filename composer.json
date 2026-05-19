@@ -27,7 +27,7 @@
     }
   },
   "require": {
-    "php": ">=8.2",
+    "php": ">=8.3",
     "ext-json": "*",
     "doctrine/dbal": "^4.0",
     "solophp/contracts": "^1.4",
