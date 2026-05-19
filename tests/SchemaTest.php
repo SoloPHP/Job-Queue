@@ -32,7 +32,7 @@ final class SchemaTest extends TestCase
 
         $indexes = array_keys($conn->createSchemaManager()->listTableIndexes('jobs'));
         $this->assertContains('idx_jobs_status_scheduled', $indexes);
-        $this->assertContains('idx_jobs_type', $indexes);
+        $this->assertContains('idx_jobs_type_status_scheduled', $indexes);
         $this->assertContains('idx_jobs_locked_at', $indexes);
     }
 
@@ -46,6 +46,7 @@ final class SchemaTest extends TestCase
         $this->assertStringContainsString('CHARSET=utf8mb4', $sql);
         $this->assertStringContainsString('payload JSON NOT NULL', $sql);
         $this->assertStringContainsString('INDEX idx_status_scheduled', $sql);
+        $this->assertStringContainsString('INDEX idx_type_status_scheduled', $sql);
     }
 
     public function testPostgresInstallEmitsJsonbAndSeparateIndexes(): void
@@ -58,14 +59,14 @@ final class SchemaTest extends TestCase
         $this->assertStringContainsString('BIGSERIAL', $joined);
         $this->assertStringContainsString('JSONB NOT NULL', $joined);
         $this->assertStringContainsString('idx_jobs_status_scheduled', $joined);
-        $this->assertStringContainsString('idx_jobs_type', $joined);
+        $this->assertStringContainsString('idx_jobs_type_status_scheduled', $joined);
         $this->assertStringContainsString('idx_jobs_locked_at', $joined);
     }
 
     public function testUnsupportedPlatformThrows(): void
     {
-        $platform = $this->createMock(AbstractPlatform::class);
-        $connection = $this->createMock(Connection::class);
+        $platform = $this->createStub(AbstractPlatform::class);
+        $connection = $this->createStub(Connection::class);
         $connection->method('getDatabasePlatform')->willReturn($platform);
 
         $this->expectException(RuntimeException::class);
@@ -80,8 +81,8 @@ final class SchemaTest extends TestCase
      */
     private function captureStatementsFor(string $platformClass): array
     {
-        $platform = $this->createMock($platformClass);
-        $connection = $this->createMock(Connection::class);
+        $platform = $this->createStub($platformClass);
+        $connection = $this->createStub(Connection::class);
         $connection->method('getDatabasePlatform')->willReturn($platform);
 
         $statements = [];

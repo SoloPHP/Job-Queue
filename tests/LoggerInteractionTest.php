@@ -4,66 +4,48 @@ declare(strict_types=1);
 
 namespace Solo\JobQueue\Tests;
 
-use Doctrine\DBAL\Connection;
-use Doctrine\DBAL\DriverManager;
-use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Solo\JobQueue\JobQueue;
-use Solo\JobQueue\Schema;
-use Solo\JobQueue\Tests\Fixtures\ArrayContainer;
+use Solo\JobQueue\RetryPolicy;
 use Solo\JobQueue\Tests\Fixtures\FailingJob;
-use Solo\JobQueue\Tests\Fixtures\Recorder;
 use Solo\JobQueue\Tests\Fixtures\SpyLogger;
 
-final class LoggerInteractionTest extends TestCase
+final class LoggerInteractionTest extends QueueTestCase
 {
-    private Connection $connection;
     private SpyLogger $logger;
-    private ArrayContainer $container;
 
     protected function setUp(): void
     {
-        $this->connection = DriverManager::getConnection([
-            'driver' => 'pdo_sqlite',
-            'memory' => true,
-        ]);
-        Schema::install($this->connection);
+        parent::setUp();
 
         $this->logger = new SpyLogger();
-        $this->container = new ArrayContainer([Recorder::class => new Recorder()]);
     }
 
     public function testExceptionPassedUnderPsr3ExceptionKey(): void
     {
         $queue = new JobQueue(
-            connection: $this->connection,
-            maxRetries: 1,
-            baseRetryDelay: 1,
+            storage:   $this->storage,
+            retry:     new RetryPolicy(maxRetries: 1, baseDelay: 1),
             container: $this->container,
-            logger: $this->logger,
+            logger:    $this->logger,
         );
 
         $queue->push(new FailingJob('boom'));
         $queue->processJobs();
 
-        $threw = $this->logger->byMessage('Job threw exception');
-        $this->assertCount(1, $threw);
-        $this->assertInstanceOf(RuntimeException::class, $threw[0]['context']['exception'] ?? null);
-        $this->assertArrayNotHasKey('error', $threw[0]['context']);
-
         $perm = $this->logger->byMessage('Job permanently failed');
         $this->assertCount(1, $perm);
         $this->assertInstanceOf(RuntimeException::class, $perm[0]['context']['exception'] ?? null);
+        $this->assertArrayNotHasKey('error', $perm[0]['context']);
     }
 
     public function testRetryLogAlsoCarriesThrowable(): void
     {
         $queue = new JobQueue(
-            connection: $this->connection,
-            maxRetries: 3,
-            baseRetryDelay: 1,
+            storage:   $this->storage,
+            retry:     new RetryPolicy(maxRetries: 3, baseDelay: 1),
             container: $this->container,
-            logger: $this->logger,
+            logger:    $this->logger,
         );
 
         $queue->push(new FailingJob('boom'));

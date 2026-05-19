@@ -36,19 +36,33 @@ final class LockGuardTest extends TestCase
 
     public function testAcquireFailsWhenDirectoryCannotBeCreated(): void
     {
-        if (posix_geteuid() === 0) {
-            $this->markTestSkipped('Cannot reliably test unwritable paths as root.');
-        }
-
-        $readonly = sys_get_temp_dir() . '/job-queue-ro-' . uniqid('', true);
-        mkdir($readonly, 0500, true);
+        // Touch a regular file, then try to use it as a parent directory. mkdir
+        // fails because the path exists but is not a directory — independent of
+        // filesystem permissions, so this works under root too.
+        $blocker = sys_get_temp_dir() . '/job-queue-blocker-' . uniqid('', true);
+        touch($blocker);
 
         try {
-            $guard = new LockGuard($readonly . '/nested/worker.lock');
+            $guard = new LockGuard($blocker . '/worker.lock');
             $this->assertFalse($guard->acquire());
         } finally {
-            @chmod($readonly, 0755);
-            @rmdir($readonly);
+            @unlink($blocker);
+        }
+    }
+
+    public function testAcquireFailsWhenFileCannotBeOpened(): void
+    {
+        // Open() on a path that exists as a directory fails: dirname() resolves
+        // to a real directory so the mkdir branch is skipped, then fopen() with
+        // mode 'c' on a directory returns false.
+        $dir = sys_get_temp_dir() . '/job-queue-isdir-' . uniqid('', true);
+        mkdir($dir);
+
+        try {
+            $guard = new LockGuard($dir);
+            $this->assertFalse($guard->acquire());
+        } finally {
+            @rmdir($dir);
         }
     }
 
