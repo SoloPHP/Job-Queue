@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 — Unreleased
+## 2.0.0 — 2026-11-01
 
 A rewrite with a new schema and execution API. Read [UPGRADING.md](UPGRADING.md) before upgrading.
 
