@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue;
+namespace Solo\JobQueue\Worker;
+
+use InvalidArgumentException;
 
 /**
  * Restart limits for {@see Worker}. Each limit is opt-in (0 = unlimited).
@@ -17,6 +19,9 @@ final readonly class WorkerLimits
         public int $maxRuntime = 0,
         public int $maxMemoryMb = 0,
     ) {
+        if ($maxJobs < 0 || $maxRuntime < 0 || $maxMemoryMb < 0) {
+            throw new InvalidArgumentException('Worker limits must be non-negative');
+        }
     }
 
     /**
@@ -30,13 +35,14 @@ final readonly class WorkerLimits
     /**
      * Return the reason key for the first limit reached, or null if none.
      * Reasons: 'max_jobs', 'max_runtime', 'max_memory'.
+     * $elapsedSeconds is the duration measured by the worker's monotonic clock.
      */
-    public function reachedReason(int $totalProcessed, int $startedAt): ?string
+    public function reachedReason(int $totalProcessed, float $elapsedSeconds): ?string
     {
         if ($this->maxJobs > 0 && $totalProcessed >= $this->maxJobs) {
             return 'max_jobs';
         }
-        if ($this->maxRuntime > 0 && (time() - $startedAt) >= $this->maxRuntime) {
+        if ($this->maxRuntime > 0 && $elapsedSeconds >= $this->maxRuntime) {
             return 'max_runtime';
         }
         if ($this->maxMemoryMb > 0 && ((int) (memory_get_usage(true) / 1048576)) >= $this->maxMemoryMb) {

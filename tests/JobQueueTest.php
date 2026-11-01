@@ -4,492 +4,484 @@ declare(strict_types=1);
 
 namespace Solo\JobQueue\Tests;
 
-use Closure;
 use DateTimeImmutable;
-use Doctrine\DBAL\Connection;
-use Doctrine\DBAL\Platforms\SQLitePlatform;
 use InvalidArgumentException;
-use Solo\JobQueue\JobQueue;
-use Solo\JobQueue\RetryPolicy;
-use Solo\JobQueue\Storage\DbalJobStorage;
-use Solo\JobQueue\Tests\Fixtures\FailingJob;
-use Solo\JobQueue\Tests\Fixtures\JobWithoutFactory;
-use Solo\JobQueue\Tests\Fixtures\NotAJob;
-use Solo\JobQueue\Tests\Fixtures\RecordingListener;
-use Solo\JobQueue\Tests\Fixtures\SimpleJob;
+use RuntimeException;
+use Solo\Contracts\JobQueue\JobInterface;
+use Solo\Contracts\JobQueue\JobQueueListener;
+use Solo\JobQueue\{ClaimedJob, JobQueue, JobStatus, RetryPolicy};
+use Solo\JobQueue\Codec\JobCodecInterface;
+use Solo\JobQueue\Storage\JobStorageInterface;
+use Solo\JobQueue\Tests\Fixtures\{FailingJob, SimpleJob, UnstorableErrorJob};
+use Solo\JobQueue\Tests\Support\{CallbackCodec, DatabaseTestCase, FrozenClock, RecordingListener};
+use Throwable;
 
-final class JobQueueTest extends QueueTestCase
+final class JobQueueTest extends DatabaseTestCase
 {
+    private FrozenClock $clock;
     private JobQueue $queue;
 
     protected function setUp(): void
     {
         parent::setUp();
+        $this->clock = new FrozenClock();
+        $this->queue = $this->queue();
+    }
 
-        $this->queue = new JobQueue(
-            storage:   $this->storage,
-            container: $this->container,
+    private function queue(
+        ?RetryPolicy $retry = null,
+        ?JobQueueListener $listener = null,
+        bool $delete = false,
+    ): JobQueue {
+        return new JobQueue(
+            $this->storage,
+            $this->codec(),
+            retry: $retry,
+            deleteOnSuccess: $delete,
+            listener: $listener,
+            clock: $this->clock,
         );
     }
 
-    public function testTypeFilteringRunsOnlyMatchingJobs(): void
+    public function testTypeFilteringAndCounts(): void
     {
-        $this->queue->push(new SimpleJob('A'), 'email');
-        $this->queue->push(new SimpleJob('B'), 'webhook');
-
-        $this->queue->processJobs(10, 'email');
-        $this->assertSame(['A'], $this->recorder->items);
-
-        $this->queue->processJobs(10, 'webhook');
-        $this->assertSame(['A', 'B'], $this->recorder->items);
+        $this->queue->push(new SimpleJob('email'), 'email');
+        $this->queue->push(new SimpleJob('webhook'), 'webhook');
+        $this->assertCount(1, $this->queue->getPendingJobs(10, 'email'));
+        $this->assertSame(1, $this->queue->processJobs(10, 'email'));
+        $this->assertSame(['email'], $this->recorder->items);
+        $this->assertSame(
+            ['pending' => 1, 'in_progress' => 0, 'completed' => 1, 'failed' => 0, 'expired' => 0],
+            $this->queue->getStats(),
+        );
+        $this->assertSame(1, $this->queue->processJobs(10, 'webhook'));
+        $this->assertSame(['email', 'webhook'], $this->recorder->items);
     }
 
-    public function testFailingJobMarkedFailedAfterMaxRetries(): void
+    public function testInspectionReturnsTypedRecords(): void
     {
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 2, baseDelay: 1),
-            container: $this->container,
+        $expiresAt = $this->clock->now()->modify('+1 hour');
+        $id = $this->queue->push(new SimpleJob('A'), 'email', expiresAt: $expiresAt);
+        [$record] = $this->queue->getPendingJobs();
+        $this->assertSame($id, $record->id);
+        $this->assertSame(SimpleJob::class, $record->name);
+        $this->assertSame('email', $record->type);
+        $this->assertSame(JobStatus::Pending, $record->status);
+        $this->assertSame([0, 3], [$record->attempts, $record->maxAttempts]);
+        $this->assertNull($record->error);
+        $this->assertNull($record->finishedAt);
+        $this->assertEquals($this->clock->now(), $record->scheduledAt);
+        $this->assertEquals($this->clock->now(), $record->createdAt);
+        $this->assertEquals($expiresAt, $record->expiresAt);
+        $this->assertEquals(
+            ['job_class' => SimpleJob::class, 'job_data' => ['value' => 'A']],
+            json_decode($record->payload, true, 512, JSON_THROW_ON_ERROR),
         );
-
-        $id = $queue->push(new FailingJob('boom'));
-
-        $queue->processJobs();
-        $this->rewindScheduledAt($id);
-        $queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('failed', $row['status']);
-        $this->assertSame(2, (int) $row['retry_count']);
     }
 
-    public function testStuckJobAtMaxRetriesIsMarkedFailed(): void
+    public function testPolicyIsPersistedAndFirstRetryUsesBaseDelay(): void
     {
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 2, lockTimeout: 60),
-            container: $this->container,
-        );
+        $producer = $this->queue(new RetryPolicy(maxAttempts: 2, baseDelay: 10));
+        $id = $producer->push(new FailingJob('boom'));
+        $consumer = $this->queue(new RetryPolicy(maxAttempts: 99, baseDelay: 999));
+        $this->assertSame(1, $consumer->processJobs(1));
+        $this->assertSame(0, $consumer->processJobs(1));
+        $this->clock->advance(10);
+        $this->assertSame(1, $consumer->processJobs(1));
+        $record = $consumer->getFailedJobs()[0];
+        $this->assertSame($id, $record->id);
+        $this->assertSame(2, $record->attempts);
+    }
 
+    public function testFailedInspectionAndManualRetry(): void
+    {
+        $queue = $this->queue(new RetryPolicy(maxAttempts: 1));
+        $id = $queue->push(new FailingJob('boom'), 'email');
+        $queue->processJobs(1);
+        $this->assertCount(1, $queue->getFailedJobs(50, 'email'));
+        $this->assertSame([], $queue->getFailedJobs(50, 'other'));
+        $this->assertTrue($queue->retry($id));
+        $this->assertSame(0, $queue->getPendingJobs()[0]->attempts);
+        $this->assertFalse($queue->retry($id));
+        $this->assertFalse($queue->retry(999999));
+    }
+
+    public function testExpiredJobsBecomeTerminalAndNeedNewDeadlineToRetry(): void
+    {
+        $id = $this->queue->push(new SimpleJob('expired'), expiresAt: $this->clock->now());
+        $this->assertSame(0, $this->queue->processJobs());
+        $this->assertSame(1, $this->queue->getStats()['expired']);
+        $this->assertSame(0, $this->queue->getStats()['pending']);
+        $this->assertFalse($this->queue->retry($id));
+        $this->assertFalse($this->queue->retry($id, $this->clock->now()));
+        $this->assertTrue($this->queue->retry($id, $this->clock->now()->modify('+1 hour')));
+        $this->assertSame(1, $this->queue->processJobs());
+    }
+
+    public function testExpiredFailedJobCannotBecomeUnreachablePending(): void
+    {
+        $queue = $this->queue(new RetryPolicy(maxAttempts: 1));
+        $id = $queue->push(new FailingJob('boom'), expiresAt: $this->clock->now()->modify('+1 minute'));
+        $queue->processJobs(1);
+        $this->clock->advance(60);
+        $this->assertFalse($queue->retry($id));
+        $this->assertSame(0, $queue->getStats()['pending']);
+        $this->assertTrue($queue->retry($id, $this->clock->now()->modify('+1 hour')));
+    }
+
+    public function testRetryThatWouldMissTheDeadlineExpiresImmediately(): void
+    {
+        $listener = new RecordingListener();
+        $queue = $this->queue(new RetryPolicy(maxAttempts: 3, baseDelay: 60), $listener);
+        $id = $queue->push(new FailingJob('boom'), expiresAt: $this->clock->now()->modify('+30 seconds'));
+        $this->assertSame(1, $queue->processJobs(1));
+        $this->assertSame(1, $queue->getStats()['expired']);
+        $this->assertSame([
+            ['event' => 'claimed', 'id' => $id, 'class' => FailingJob::class],
+            ['event' => 'failed', 'id' => $id, 'permanent' => true, 'error' => RuntimeException::class],
+        ], $listener->events);
+    }
+
+    public function testDeleteOnSuccessAndListenerEvents(): void
+    {
+        $listener = new RecordingListener();
+        $queue = $this->queue(listener: $listener, delete: true);
         $id = $queue->push(new SimpleJob('A'));
-        $this->connection->executeStatement(
-            "UPDATE jobs SET status = 'in_progress', locked_at = ?, retry_count = 1 WHERE id = ?",
-            [(new DateTimeImmutable('-5 minutes'))->format('Y-m-d H:i:s'), $id]
-        );
-
         $queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('failed', $row['status']);
-        $this->assertSame(2, (int) $row['retry_count']);
-        $this->assertSame([], $this->recorder->items);
+        $this->assertSame(0, (int) $this->connection->fetchOne('SELECT COUNT(*) FROM jobs'));
+        $this->assertSame([
+            ['event' => 'claimed', 'id' => $id, 'class' => SimpleJob::class],
+            ['event' => 'completed', 'id' => $id],
+        ], $listener->events);
     }
 
-    public function testDeleteOnSuccessRemovesCompletedJob(): void
+    public function testObserverFailureNeverRetriesSuccessfulJob(): void
     {
-        $queue = new JobQueue(
-            storage: $this->storage,
-            deleteOnSuccess: true,
-            container: $this->container,
+        $listener = new class implements JobQueueListener {
+            public function onClaimed(int $jobId, string $jobClass): void
+            {
+            }
+            public function onCompleted(int $jobId): void
+            {
+                throw new RuntimeException('observer failed');
+            }
+            public function onFailed(int $jobId, Throwable|string $error, bool $permanent): void
+            {
+                throw new RuntimeException('must not fail');
+            }
+            public function onReclaimed(int $requeuedCount, int $permanentlyFailedCount): void
+            {
+            }
+        };
+        $queue = $this->queue(new RetryPolicy(baseDelay: 0), $listener);
+        $queue->push(new SimpleJob('once'));
+        try {
+            $queue->processJobs();
+            $this->fail('Observer error must propagate');
+        } catch (RuntimeException $e) {
+            $this->assertSame('observer failed', $e->getMessage());
+        }
+        $this->assertSame(1, $queue->getStats()['completed']);
+        $this->assertSame(0, $queue->processJobs());
+        $this->assertSame(['once'], $this->recorder->items);
+    }
+
+    public function testCompletionPersistenceFailureDoesNotCallFail(): void
+    {
+        $storage = $this->createMock(JobStorageInterface::class);
+        $leaseUntil = $this->clock->now()->modify('+600 seconds');
+        $payload = $this->codec()->encode(new SimpleJob('once'));
+        $storage->method('claim')->willReturn(
+            new ClaimedJob(1, SimpleJob::class, $payload, 1, 'token', $leaseUntil, new RetryPolicy()),
         );
-
-        $id = $queue->push(new SimpleJob('A'));
-        $queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertFalse($row);
+        $storage->method('complete')->willThrowException(new RuntimeException('db unavailable'));
+        $storage->expects($this->never())->method('fail');
+        $queue = new JobQueue($storage, $this->codec(), clock: $this->clock);
+        $this->expectExceptionMessage('db unavailable');
+        $queue->processNext();
     }
 
-    public function testGetPendingJobsFiltersByType(): void
+    public function testMaintenanceReclaimsWithEachJobsOwnLeaseAndPolicy(): void
     {
-        $this->queue->push(new SimpleJob('A'), 'email');
-        $this->queue->push(new SimpleJob('B'), 'webhook');
-
-        $pending = $this->queue->getPendingJobs(10, 'email');
-        $this->assertCount(1, $pending);
-        $this->assertSame('email', $pending[0]['type']);
+        $long = new JobQueue(
+            $this->storage,
+            $this->codec(),
+            retry: new RetryPolicy(maxAttempts: 2, baseDelay: 7),
+            leaseDuration: 1800,
+            clock: $this->clock,
+        );
+        $short = new JobQueue(
+            $this->storage,
+            $this->codec(),
+            retry: new RetryPolicy(maxAttempts: 1),
+            leaseDuration: 120,
+            clock: $this->clock,
+        );
+        $long->push(new SimpleJob('A'), 'long');
+        $claim = $long->claim('long');
+        $this->assertNotNull($claim);
+        $this->clock->advance(300);
+        $this->assertSame(['requeued' => 0, 'failed' => 0, 'expired' => 0], $short->maintain());
+        $this->clock->advance(1500);
+        $this->assertSame(['requeued' => 1, 'failed' => 0, 'expired' => 0], $short->maintain());
+        $this->assertFalse($long->complete($claim));
+        $beforeBackoff = $long->claim('long');
+        $this->assertNull($beforeBackoff);
+        $this->clock->advance(7);
+        $second = $long->claim('long');
+        $this->assertNotNull($second);
+        $this->assertSame(2, $second->attempt);
+        $this->clock->advance(1800);
+        $this->assertSame(['requeued' => 0, 'failed' => 1, 'expired' => 0], $short->maintain());
     }
 
-    public function testProcessJobsWithZeroLimitIsNoop(): void
+    public function testMaintenanceExpiresOverdueJobsAndNotifiesTheListener(): void
+    {
+        $listener = new RecordingListener();
+        $queue = $this->queue(listener: $listener);
+        $queue->push(new SimpleJob('stuck'), expiresAt: $this->clock->now()->modify('+700 seconds'));
+        $this->assertNotNull($queue->claim());
+        $queue->push(new SimpleJob('late'), expiresAt: $this->clock->now()->modify('+60 seconds'));
+        $this->clock->advance(800);
+        $this->assertSame(['requeued' => 0, 'failed' => 0, 'expired' => 2], $queue->maintain());
+        $this->assertSame([['event' => 'reclaimed', 'requeued' => 0, 'failed' => 1]], $listener->events);
+        $this->assertSame(2, $queue->getStats()['expired']);
+    }
+
+    public function testProcessNextDoesNotRunMaintenance(): void
     {
         $this->queue->push(new SimpleJob('A'));
-        $this->queue->processJobs(0);
-
-        $this->assertSame([], $this->recorder->items);
+        $this->assertNotNull($this->queue->claim());
+        $this->clock->advance(601);
+        $this->assertFalse($this->queue->processNext());
+        $this->assertSame(1, $this->queue->getStats()['in_progress']);
+        $this->assertSame(0, $this->queue->processJobs());
+        $this->assertSame(1, $this->queue->getStats()['pending']);
     }
 
-    public function testMarkFailedIsNoopForMissingJob(): void
+    public function testEachJobIsClaimedImmediatelyBeforeExecution(): void
     {
-        $this->queue->markFailed(99999, 'ghost');
+        $observed = [];
+        $codec = new CallbackCodec(function () use (&$observed): void {
+            $observed[] = $this->storage->countByStatus(null);
+            $this->clock->advance(6);
+        });
+        $queue = new JobQueue($this->storage, $codec, leaseDuration: 10, clock: $this->clock);
+        $queue->pushMany([new SimpleJob('1'), new SimpleJob('2'), new SimpleJob('3')]);
+        $this->assertSame(3, $queue->processJobs(3));
+        $this->assertSame([2, 1, 0], array_column($observed, 'pending'));
+        $this->assertSame([1, 1, 1], array_column($observed, 'in_progress'));
+        $this->assertSame(3, $queue->getStats()['completed']);
+    }
+
+    public function testOuterTransactionIsRejectedBeforeAnyQueueMutation(): void
+    {
+        $this->queue->push(new SimpleJob('A'));
+        $this->connection->beginTransaction();
+        try {
+            $this->queue->processJobs();
+            $this->fail('Expected consumer transaction guard');
+        } catch (RuntimeException $e) {
+            $this->assertSame([], $this->recorder->items);
+            $this->assertSame(1, $this->queue->getStats()['pending']);
+        } finally {
+            $this->connection->rollBack();
+        }
+    }
+
+    public function testRenewReturnsTheExtendedClaimButCannotReviveAnEndedLease(): void
+    {
+        $this->queue->push(new SimpleJob('A'));
+        $claim = $this->queue->claim();
+        $this->assertNotNull($claim);
+        $this->assertEquals($this->clock->now()->modify('+600 seconds'), $claim->leaseUntil);
+        $this->clock->advance(500);
+        $renewed = $this->queue->renew($claim);
+        $this->assertNotNull($renewed);
+        $this->assertSame($claim->token, $renewed->token);
+        $this->assertEquals($this->clock->now()->modify('+600 seconds'), $renewed->leaseUntil);
+        $this->clock->advance(200);
+        $this->assertTrue($this->queue->complete($claim));
+        $this->assertNull($this->queue->renew($renewed));
+
+        $this->queue->push(new SimpleJob('B'));
+        $claim = $this->queue->claim();
+        $this->assertNotNull($claim);
+        $this->clock->advance(600);
+        $this->assertNull($this->queue->renew($claim));
+    }
+
+    public function testLateAcknowledgementIsAcceptedUntilMaintenanceReclaimsTheJob(): void
+    {
+        $this->queue->push(new SimpleJob('A'));
+        $claim = $this->queue->claim();
+        $this->assertNotNull($claim);
+        $this->clock->advance(900);
+        $this->assertTrue($this->queue->complete($claim));
+        $this->assertSame(1, $this->queue->getStats()['completed']);
+
+        $this->queue->push(new SimpleJob('B'));
+        $claim = $this->queue->claim();
+        $this->assertNotNull($claim);
+        $this->clock->advance(900);
+        $this->assertSame(1, $this->queue->maintain()['requeued']);
+        $this->assertFalse($this->queue->complete($claim));
+        $this->assertFalse($this->queue->fail($claim, 'too late'));
+    }
+
+    public function testScheduleAndExpiryAreConvertedToUtc(): void
+    {
+        $this->queue->pushMany(
+            [new SimpleJob('A')],
+            'later',
+            new DateTimeImmutable('2030-01-01T03:00:00+03:00'),
+            new DateTimeImmutable('2030-01-01T04:00:00+03:00'),
+        );
+        $record = $this->queue->getPendingJobs()[0];
+        $this->assertSame('2030-01-01 00:00:00 UTC', $record->scheduledAt->format('Y-m-d H:i:s T'));
+        $this->assertSame('2030-01-01 01:00:00 UTC', $record->expiresAt?->format('Y-m-d H:i:s T'));
+        $this->assertSame(0, $this->queue->pushMany([]));
+    }
+
+    public function testZeroLimitDoesNothingAndNegativeLimitIsRejected(): void
+    {
+        $this->queue->push(new SimpleJob('A'));
+        $this->assertSame(0, $this->queue->processJobs(0));
+        $this->assertSame(1, $this->queue->getStats()['pending']);
+        $this->expectException(InvalidArgumentException::class);
+        $this->queue->processJobs(-1);
+    }
+
+    public function testFailureAfterDeadlineIsReportedAsTerminal(): void
+    {
+        $listener = new RecordingListener();
+        $queue = $this->queue(listener: $listener);
+        $id = $queue->push(new SimpleJob('A'), expiresAt: $this->clock->now()->modify('+5 seconds'));
+        $claim = $queue->claim();
+        $this->assertNotNull($claim);
+        $this->clock->advance(6);
+        $this->assertTrue($queue->fail($claim, 'too late'));
+        $this->assertSame(1, $queue->getStats()['expired']);
+        $this->assertSame(
+            [['event' => 'failed', 'id' => $id, 'permanent' => true, 'error' => 'too late']],
+            $listener->events,
+        );
+    }
+
+    public function testSlowObserverCannotStartHandlerAfterTheLeaseEnded(): void
+    {
+        $events = new RecordingListener();
+        $listener = new class ($this->clock, $events) implements JobQueueListener {
+            public function __construct(private FrozenClock $clock, private RecordingListener $events)
+            {
+            }
+            public function onClaimed(int $jobId, string $jobClass): void
+            {
+                $this->events->onClaimed($jobId, $jobClass);
+                $this->clock->advance(600);
+            }
+            public function onCompleted(int $jobId): void
+            {
+                $this->events->onCompleted($jobId);
+            }
+            public function onFailed(int $jobId, Throwable|string $error, bool $permanent): void
+            {
+                $this->events->onFailed($jobId, $error, $permanent);
+            }
+            public function onReclaimed(int $requeuedCount, int $permanentlyFailedCount): void
+            {
+                $this->events->onReclaimed($requeuedCount, $permanentlyFailedCount);
+            }
+        };
+        $queue = $this->queue(listener: $listener);
+        $id = $queue->push(new SimpleJob('must not run'));
+        $this->assertTrue($queue->processNext());
+        $this->assertSame([], $this->recorder->items);
+        $this->assertSame(1, $queue->getStats()['pending']);
+        $this->assertSame([
+            ['event' => 'claimed', 'id' => $id, 'class' => SimpleJob::class],
+            [
+                'event' => 'failed',
+                'id' => $id,
+                'permanent' => false,
+                'error' => 'Lease expired before execution started',
+            ],
+        ], $events->events);
+    }
+
+    public function testCustomCodecCannotPersistNonJsonPayloadOnAnyDatabase(): void
+    {
+        $codec = new class implements JobCodecInterface {
+            public function encode(JobInterface $job): string
+            {
+                return 'not JSON';
+            }
+
+            public function decode(string $payload): JobInterface
+            {
+                throw new RuntimeException('Unused');
+            }
+        };
+        $queue = new JobQueue($this->storage, $codec);
+        foreach ([false, true] as $bulk) {
+            try {
+                if ($bulk) {
+                    $queue->pushMany([new SimpleJob('A')]);
+                } else {
+                    $queue->push(new SimpleJob('A'));
+                }
+                $this->fail('Expected invalid codec payload to be rejected before insertion');
+            } catch (InvalidArgumentException $error) {
+                $this->assertSame('JobCodecInterface::encode() must return valid JSON.', $error->getMessage());
+            }
+        }
         $this->assertSame(0, (int) $this->connection->fetchOne('SELECT COUNT(*) FROM jobs'));
     }
 
-    public function testMarkFailedWithStringErrorSerializesToColumn(): void
+    public function testUnstorableErrorTextIsSanitizedBeforeSaving(): void
     {
-        $id = $this->queue->push(new SimpleJob('A'));
-
-        $this->queue->markFailed($id, 'something broke');
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('something broke', $row['error']);
+        $id = $this->queue->push(new UnstorableErrorJob());
+        $this->assertSame(1, $this->queue->processJobs(1));
+        $this->assertSame(1, $this->queue->getStats()['pending']);
+        $error = $this->connection->fetchOne('SELECT error FROM jobs WHERE id = ?', [$id]);
+        $this->assertIsString($error);
+        $this->assertTrue(mb_check_encoding($error, 'UTF-8'));
+        $this->assertStringNotContainsString("\0", $error);
+        $this->assertSame(16384, strlen($error));
+        $this->assertStringStartsWith(RuntimeException::class . ': upstream said ??\0xxx', $error);
+        $this->assertStringEndsWith('...', $error);
     }
 
-    public function testFailsJobWithMissingJobClassInPayload(): void
+    public function testPruneDeletesFinishedJobsOlderThanTheCutoff(): void
     {
-        $id = $this->queue->addJob(['job_data' => ['x' => 1]]);
-        $this->queue->processJobs();
+        $queue = $this->queue(new RetryPolicy(maxAttempts: 1));
+        $queue->push(new SimpleJob('old'));
+        $queue->push(new FailingJob('boom'));
+        $this->assertSame(2, $queue->processJobs());
+        $this->clock->advance(3600);
+        $recent = $queue->push(new SimpleJob('recent'));
+        $this->assertSame(1, $queue->processJobs());
+        $waiting = $queue->push(new SimpleJob('waiting'), scheduledAt: $this->clock->now()->modify('+1 day'));
+        $cutoff = $this->clock->now()->modify('-1 minute');
 
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertStringContainsString('job_class', (string) $row['error']);
+        $this->assertSame(1, $queue->prune($cutoff));
+        $this->assertSame(1, $queue->prune($cutoff, [JobStatus::Failed, JobStatus::Expired]));
+        $this->assertSame(0, $queue->prune($cutoff));
+        $this->assertSame(
+            [$recent, $waiting],
+            array_map(intval(...), $this->connection->fetchFirstColumn('SELECT id FROM jobs ORDER BY id')),
+        );
     }
 
-    public function testFailsJobWithNonExistentClass(): void
-    {
-        $id = $this->queue->addJob([
-            'job_class' => 'Foo\\Bar\\NotReal',
-            'job_data'  => [],
-        ]);
-        $this->queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertStringContainsString('does not exist', (string) $row['error']);
-    }
-
-    public function testFailsJobWhenClassDoesNotImplementJobInterface(): void
-    {
-        $id = $this->queue->addJob([
-            'job_class' => NotAJob::class,
-            'job_data'  => [],
-        ]);
-        $this->queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertStringContainsString('JobInterface', (string) $row['error']);
-    }
-
-    public function testProcessFailsJobWhenContainerMissing(): void
-    {
-        $queue = new JobQueue(storage: $this->storage);
-        $id = $queue->push(new SimpleJob('A'));
-
-        $queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertStringContainsString('container', (string) $row['error']);
-    }
-
-    public function testProcessFailsJobWithoutFactoryMethod(): void
-    {
-        $id = $this->queue->push(new JobWithoutFactory());
-        $this->queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertStringContainsString('createFromContainer', (string) $row['error']);
-    }
-
-    public function testJobDataMissingOrNonArrayDefaultsToEmpty(): void
-    {
-        // job_data absent entirely
-        $id = $this->queue->addJob(['job_class' => SimpleJob::class]);
-        $this->queue->processJobs();
-
-        // Should run with empty $data (value => '')
-        $this->assertSame([''], $this->recorder->items);
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('completed', $row['status']);
-    }
-
-    public function testInvalidTableNameRejected(): void
+    public function testPruneRejectsUnfinishedStatuses(): void
     {
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessageMatches('/Invalid table name/');
-
-        new DbalJobStorage($this->connection, 'jobs; DROP TABLE users; --');
+        $this->queue->prune($this->clock->now(), [JobStatus::Pending]);
     }
 
-    public function testPushManyInsertsAllJobsAndReturnsCount(): void
+    public function testInvalidLeaseRejected(): void
     {
-        $count = $this->queue->pushMany(
-            [new SimpleJob('A'), new SimpleJob('B'), new SimpleJob('C')],
-            'email',
-        );
-
-        $this->assertSame(3, $count);
-
-        $rows = $this->connection->fetchAllAssociative(
-            'SELECT name, type, payload FROM jobs ORDER BY id'
-        );
-        $this->assertCount(3, $rows);
-        foreach ($rows as $row) {
-            $this->assertSame('email', $row['type']);
-            $this->assertSame(SimpleJob::class, $row['name']);
-        }
-
-        $this->queue->processJobs(10, 'email');
-        $this->assertSame(['A', 'B', 'C'], $this->recorder->items);
-    }
-
-    public function testPushManyOnEmptyArrayIsNoop(): void
-    {
-        $count = $this->queue->pushMany([]);
-
-        $this->assertSame(0, $count);
-        $this->assertSame(0, (int) $this->connection->fetchOne('SELECT COUNT(*) FROM jobs'));
-    }
-
-    public function testPushManyPersistsScheduledAndExpiresAt(): void
-    {
-        $scheduled = new DateTimeImmutable('2030-01-01 10:00:00', new \DateTimeZone('UTC'));
-        $expires   = new DateTimeImmutable('2030-01-02 10:00:00', new \DateTimeZone('UTC'));
-
-        $this->queue->pushMany([new SimpleJob('A'), new SimpleJob('B')], 'later', $scheduled, $expires);
-
-        $rows = $this->connection->fetchAllAssociative('SELECT scheduled_at, expires_at FROM jobs');
-        $this->assertCount(2, $rows);
-        foreach ($rows as $row) {
-            $this->assertSame('2030-01-01 10:00:00', $row['scheduled_at']);
-            $this->assertSame('2030-01-02 10:00:00', $row['expires_at']);
-        }
-    }
-
-    public function testGetStatsCountsAllStatusesWithZeroDefaults(): void
-    {
-        $stats = $this->queue->getStats();
-
-        $this->assertSame(
-            ['pending' => 0, 'in_progress' => 0, 'completed' => 0, 'failed' => 0],
-            $stats
-        );
-    }
-
-    public function testGetStatsGroupsByStatusAndFiltersByType(): void
-    {
-        $this->queue->push(new SimpleJob('A'), 'email');
-        $this->queue->push(new SimpleJob('B'), 'email');
-        $this->queue->push(new SimpleJob('C'), 'webhook');
-
-        $this->queue->processJobs(10, 'email'); // completes both 'email' jobs
-
-        $all = $this->queue->getStats();
-        $this->assertSame(2, $all['completed']);
-        $this->assertSame(1, $all['pending']);
-
-        $emailOnly = $this->queue->getStats('email');
-        $this->assertSame(['pending' => 0, 'in_progress' => 0, 'completed' => 2, 'failed' => 0], $emailOnly);
-
-        $webhookOnly = $this->queue->getStats('webhook');
-        $this->assertSame(['pending' => 1, 'in_progress' => 0, 'completed' => 0, 'failed' => 0], $webhookOnly);
-    }
-
-    public function testProcessJobsReturnsCountOfRunJobs(): void
-    {
-        $this->queue->push(new SimpleJob('A'));
-        $this->queue->push(new SimpleJob('B'));
-
-        $this->assertSame(2, $this->queue->processJobs(10));
-        $this->assertSame(0, $this->queue->processJobs(10));
-    }
-
-    public function testListenerReceivesClaimedAndCompletedEvents(): void
-    {
-        $listener = new RecordingListener();
-        $queue = new JobQueue(
-            storage: $this->storage,
-            container: $this->container,
-            listener:  $listener,
-        );
-
-        $id = $queue->push(new SimpleJob('A'));
-        $queue->processJobs();
-
-        $this->assertSame(
-            [
-                ['event' => 'claimed', 'id' => $id, 'class' => SimpleJob::class],
-                ['event' => 'completed', 'id' => $id],
-            ],
-            $listener->events
-        );
-    }
-
-    public function testListenerReceivesFailedEventsWithPermanentFlag(): void
-    {
-        $listener = new RecordingListener();
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 2, baseDelay: 1),
-            container: $this->container,
-            listener:  $listener,
-        );
-
-        $id = $queue->push(new FailingJob('boom'));
-        $queue->processJobs();
-        $this->rewindScheduledAt($id);
-        $queue->processJobs();
-
-        $failed = array_values(array_filter(
-            $listener->events,
-            static fn(array $e): bool => $e['event'] === 'failed'
-        ));
-
-        $this->assertCount(2, $failed);
-        $this->assertFalse($failed[0]['permanent']);
-        $this->assertTrue($failed[1]['permanent']);
-    }
-
-    public function testListenerReceivesReclaimedEvent(): void
-    {
-        $listener = new RecordingListener();
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 3, lockTimeout: 60),
-            container: $this->container,
-            listener:  $listener,
-        );
-
-        $id = $queue->push(new SimpleJob('A'));
-        $this->connection->executeStatement(
-            "UPDATE jobs SET status = 'in_progress', locked_at = ? WHERE id = ?",
-            [(new DateTimeImmutable('-5 minutes'))->format('Y-m-d H:i:s'), $id]
-        );
-
-        $result = $queue->reclaimStuck();
-
-        $this->assertSame(['requeued' => 1, 'failed' => 0], $result);
-        $this->assertContains(
-            ['event' => 'reclaimed', 'requeued' => 1, 'failed' => 0],
-            $listener->events
-        );
-    }
-
-    public function testAutoReclaimFalseSkipsReclaimInProcessJobs(): void
-    {
-        $queue = new JobQueue(
-            storage:     $this->storage,
-            retry:       new RetryPolicy(lockTimeout: 60),
-            container:   $this->container,
-            autoReclaim: false,
-        );
-
-        $id = $queue->push(new SimpleJob('A'));
-        $this->connection->executeStatement(
-            "UPDATE jobs SET status = 'in_progress', locked_at = ? WHERE id = ?",
-            [(new DateTimeImmutable('-5 minutes'))->format('Y-m-d H:i:s'), $id]
-        );
-
-        $queue->processJobs();
-
-        $row = $this->connection->fetchAssociative('SELECT status FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('in_progress', $row['status']);
-    }
-
-    public function testGetFailedJobsReturnsFailedRowsFilteredByType(): void
-    {
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 1, baseDelay: 1),
-            container: $this->container,
-        );
-
-        $emailId = $queue->push(new FailingJob('boom'), 'email');
-        $hookId  = $queue->push(new FailingJob('boom'), 'webhook');
-
-        $queue->processJobs(10, 'email');
-        $queue->processJobs(10, 'webhook');
-
-        $all = $queue->getFailedJobs();
-        $this->assertCount(2, $all);
-
-        $emails = $queue->getFailedJobs(50, 'email');
-        $this->assertCount(1, $emails);
-        $this->assertSame((string) $emailId, (string) $emails[0]['id']);
-
-        $hooks = $queue->getFailedJobs(50, 'webhook');
-        $this->assertCount(1, $hooks);
-        $this->assertSame((string) $hookId, (string) $hooks[0]['id']);
-    }
-
-    public function testRetryResetsFailedJobToPending(): void
-    {
-        $queue = new JobQueue(
-            storage:   $this->storage,
-            retry:     new RetryPolicy(maxRetries: 1, baseDelay: 1),
-            container: $this->container,
-        );
-
-        $id = $queue->push(new FailingJob('boom'));
-        $queue->processJobs();
-
-        $this->assertTrue($queue->retry($id));
-
-        $row = $this->connection->fetchAssociative('SELECT * FROM jobs WHERE id = ?', [$id]);
-        $this->assertIsArray($row);
-        $this->assertSame('pending', $row['status']);
-        $this->assertSame(0, (int) $row['retry_count']);
-        $this->assertNull($row['error']);
-    }
-
-    public function testRetryReturnsFalseForMissingOrNonFailedJob(): void
-    {
-        $this->assertFalse($this->queue->retry(99999));
-
-        $id = $this->queue->push(new SimpleJob('A'));
-        $this->assertFalse($this->queue->retry($id)); // status is 'pending', not 'failed'
-    }
-
-    public function testClaimDiscardsRowsWithMalformedDriverOutput(): void
-    {
-        $platform = $this->createStub(SQLitePlatform::class);
-        $conn = $this->createStub(Connection::class);
-        $conn->method('getDatabasePlatform')->willReturn($platform);
-        $conn->method('transactional')->willReturnCallback(
-            static fn(Closure $f): mixed => $f($conn)
-        );
-        $conn->method('fetchFirstColumn')->willReturn([1]);
-        $conn->method('executeStatement')->willReturn(1);
-        $conn->method('fetchAllAssociative')->willReturn([
-            ['id' => 1, 'name' => null, 'payload' => 'x'],
-        ]);
-
-        $queue = new JobQueue(storage: new DbalJobStorage($conn), autoReclaim: false);
-
-        $this->assertSame(0, $queue->processJobs(1));
-    }
-
-    public function testTimestampsAreStoredInUtc(): void
-    {
-        $previousTz = date_default_timezone_get();
-        date_default_timezone_set('America/New_York');
-
-        try {
-            $queue = new JobQueue(storage: new DbalJobStorage($this->connection), container: $this->container);
-            $queue->push(new SimpleJob('A'));
-
-            /** @var string $scheduled */
-            $scheduled = $this->connection->fetchOne('SELECT scheduled_at FROM jobs LIMIT 1');
-
-            $stored = new DateTimeImmutable($scheduled . ' UTC');
-            $now = new DateTimeImmutable('now', new \DateTimeZone('UTC'));
-            $this->assertLessThan(5, abs($now->getTimestamp() - $stored->getTimestamp()));
-        } finally {
-            date_default_timezone_set($previousTz);
-        }
-    }
-
-    private function rewindScheduledAt(int $id): void
-    {
-        $this->connection->executeStatement(
-            'UPDATE jobs SET scheduled_at = ? WHERE id = ?',
-            [(new DateTimeImmutable('-1 second'))->format('Y-m-d H:i:s'), $id]
-        );
+        $this->expectException(InvalidArgumentException::class);
+        new JobQueue($this->storage, $this->codec(), leaseDuration: 0);
     }
 }

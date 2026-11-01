@@ -1,5 +1,6 @@
 # Composer
 /vendor/
+/composer.lock
 
 # PHPUnit
 .phpunit.cache/
@@ -40,9 +41,6 @@ logs/
 *.temp
 temp/
 tmp/
-
-# Runtime locks (from LockGuard)
-*.lock
 
 # Coverage reports
 coverage/

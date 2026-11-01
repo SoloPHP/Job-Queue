@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests\Fixtures;
+namespace Solo\JobQueue\Tests\Support;
 
 use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
@@ -20,7 +20,9 @@ final class ArrayContainer implements ContainerInterface
     public function get(string $id): mixed
     {
         if (!array_key_exists($id, $this->services)) {
-            throw new class ("Service not found: {$id}") extends RuntimeException implements NotFoundExceptionInterface {
+            throw new class ("Service not found: {$id}") extends RuntimeException implements
+                NotFoundExceptionInterface
+            {
             };
         }
         return $this->services[$id];

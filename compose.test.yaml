@@ -1,0 +1,59 @@
+# Disposable databases for QUEUE_TEST_DRIVER integration tests.
+# Read the assigned local port with: docker compose -f compose.test.yaml port mysql 3306
+# Remove containers and anonymous image volumes with: docker compose -f compose.test.yaml down --volumes
+name: job-queue-tests
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root_test
+      MYSQL_DATABASE: queue_test
+      MYSQL_USER: queue_test
+      MYSQL_PASSWORD: queue_test
+    ports:
+      - "127.0.0.1::3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uqueue_test -pqueue_test --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mariadb:
+    image: mariadb:12.3
+    environment:
+      MARIADB_ROOT_PASSWORD: root_test
+      MARIADB_DATABASE: queue_test
+      MARIADB_USER: queue_test
+      MARIADB_PASSWORD: queue_test
+    ports:
+      - "127.0.0.1::3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: queue_test
+      POSTGRES_USER: queue_test
+      POSTGRES_PASSWORD: queue_test
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1::5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "queue_test", "-d", "queue_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
