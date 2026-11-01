@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue;
+namespace Solo\JobQueue\Storage;
 
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -11,6 +11,7 @@ use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\DBAL\Platforms\SQLitePlatform;
 use InvalidArgumentException;
 use RuntimeException;
+use Solo\JobQueue\RetryPolicy;
 
 /** Creates v2 tables and explicitly migrates stopped v1 queues. */
 final class Schema

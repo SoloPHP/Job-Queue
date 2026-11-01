@@ -13,12 +13,14 @@ A rewrite with a new schema and execution API. Read [UPGRADING.md](UPGRADING.md)
 - `Worker` option `maintenanceInterval` (default 60 seconds).
 - `prune()` and the `finished_at` column for deleting finished history.
 - `JobRecord` read model for `getPendingJobs()` and `getFailedJobs()`.
-- `JobProducerInterface`, `JobProcessorInterface`, `JobCodecInterface`, `ContainerJobCodec` and `PersistableJobInterface`.
+- `JobQueue` implements `JobProducerInterface` and `JobProcessorInterface` from `solophp/contracts` 1.9.
+- `Codec` namespace: `JobCodecInterface`, `ContainerJobCodec` and `PersistableJobInterface`.
 - PSR-20 clock injection.
 - `Schema::migrate()` for v1 tables.
 
 ### Changed
 
+- Classes are grouped by component: `Schema` moved to `Solo\JobQueue\Storage`, `Worker` and `WorkerLimits` to `Solo\JobQueue\Worker`.
 - MySQL/MariaDB claims run at READ COMMITTED, so concurrent workers no longer deadlock. Servers with binary logging need `binlog_format` ROW or MIXED.
 - Consumer statements aborted by deadlocks, lock wait timeouts or busy SQLite databases are retried.
 - Expiry maintenance uses a `(status, expires_at)` index instead of scanning every pending job.
@@ -26,7 +28,7 @@ A rewrite with a new schema and execution API. Read [UPGRADING.md](UPGRADING.md)
 - Stored error text is valid UTF-8 without NUL bytes, at most 16 KB.
 - `DbalJobStorage` connects on first use rather than when constructed.
 - `JobStorageInterface` is internal.
-- `ext-mbstring` is required; `ext-json` is no longer listed.
+- `ext-mbstring` and `solophp/contracts` ^1.9 are required; `ext-json` is no longer listed.
 
 ### Removed
 

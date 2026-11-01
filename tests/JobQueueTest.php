@@ -9,13 +9,14 @@ use InvalidArgumentException;
 use RuntimeException;
 use Solo\Contracts\JobQueue\JobInterface;
 use Solo\Contracts\JobQueue\JobQueueListener;
-use Solo\JobQueue\{ClaimedJob, JobCodecInterface, JobQueue, JobStatus, RetryPolicy};
+use Solo\JobQueue\{ClaimedJob, JobQueue, JobStatus, RetryPolicy};
+use Solo\JobQueue\Codec\JobCodecInterface;
 use Solo\JobQueue\Storage\JobStorageInterface;
-use Solo\JobQueue\Tests\Fixtures\{CallbackCodec, FailingJob, FrozenClock, RecordingListener};
-use Solo\JobQueue\Tests\Fixtures\{SimpleJob, UnstorableErrorJob};
+use Solo\JobQueue\Tests\Fixtures\{FailingJob, SimpleJob, UnstorableErrorJob};
+use Solo\JobQueue\Tests\Support\{CallbackCodec, DatabaseTestCase, FrozenClock, RecordingListener};
 use Throwable;
 
-final class JobQueueTest extends QueueTestCase
+final class JobQueueTest extends DatabaseTestCase
 {
     private FrozenClock $clock;
     private JobQueue $queue;

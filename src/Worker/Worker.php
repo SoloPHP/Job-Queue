@@ -2,11 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue;
+namespace Solo\JobQueue\Worker;
 
 use Closure;
 use InvalidArgumentException;
 use Psr\Log\LoggerInterface;
+use Solo\Contracts\JobQueue\JobProcessorInterface;
 
 /**
  * Long-running worker daemon. Executes one job at a time with `processNext()`, runs
@@ -53,10 +54,10 @@ final class Worker
 
         try {
             $this->logger?->info('Worker started', [
-                'type'        => $this->type,
-                'max_jobs'    => $this->limits->maxJobs,
+                'type' => $this->type,
+                'max_jobs' => $this->limits->maxJobs,
                 'max_runtime' => $this->limits->maxRuntime,
-                'max_memory'  => $this->limits->maxMemoryMb,
+                'max_memory' => $this->limits->maxMemoryMb,
                 'maintenance_interval' => $this->maintenanceInterval,
             ]);
 
@@ -88,7 +89,7 @@ final class Worker
             }
 
             $this->logger?->info('Worker stopped', [
-                'processed'   => $totalProcessed,
+                'processed' => $totalProcessed,
                 'runtime_sec' => self::secondsSince($startedAt),
             ]);
         } finally {

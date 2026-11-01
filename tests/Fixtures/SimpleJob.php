@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace Solo\JobQueue\Tests\Fixtures;
 
 use Psr\Container\ContainerInterface;
-use Solo\JobQueue\PersistableJobInterface;
+use Solo\JobQueue\Codec\PersistableJobInterface;
+use Solo\JobQueue\Tests\Support\Recorder;
 
 final class SimpleJob implements PersistableJobInterface
 {

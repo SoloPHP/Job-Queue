@@ -6,7 +6,7 @@ declare(strict_types=1);
 
 use Doctrine\DBAL\DriverManager;
 use Solo\Contracts\JobQueue\JobInterface;
-use Solo\JobQueue\JobCodecInterface;
+use Solo\JobQueue\Codec\JobCodecInterface;
 use Solo\JobQueue\JobQueue;
 use Solo\JobQueue\Storage\DbalJobStorage;
 

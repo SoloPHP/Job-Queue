@@ -2,24 +2,24 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Codec;
 
 use InvalidArgumentException;
 use JsonException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Solo\Contracts\JobQueue\JobInterface;
-use Solo\JobQueue\ContainerJobCodec;
-use Solo\JobQueue\PersistableJobInterface;
-use Solo\JobQueue\Tests\Fixtures\ArrayContainer;
+use Solo\JobQueue\Codec\ContainerJobCodec;
+use Solo\JobQueue\Codec\PersistableJobInterface;
 use Solo\JobQueue\Tests\Fixtures\JobWithoutFactory;
 use Solo\JobQueue\Tests\Fixtures\LegacyContainerJob;
-use Solo\JobQueue\Tests\Fixtures\Recorder;
 use Solo\JobQueue\Tests\Fixtures\SimpleJob;
 use Solo\JobQueue\Tests\Fixtures\StatelessJob;
+use Solo\JobQueue\Tests\Support\ArrayContainer;
+use Solo\JobQueue\Tests\Support\Recorder;
 use stdClass;
 
-final class JobCodecTest extends TestCase
+final class ContainerJobCodecTest extends TestCase
 {
     public function testJobRoundTripsWithContainerDependencies(): void
     {

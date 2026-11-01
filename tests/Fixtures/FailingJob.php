@@ -6,7 +6,7 @@ namespace Solo\JobQueue\Tests\Fixtures;
 
 use Psr\Container\ContainerInterface;
 use RuntimeException;
-use Solo\JobQueue\PersistableJobInterface;
+use Solo\JobQueue\Codec\PersistableJobInterface;
 
 final class FailingJob implements PersistableJobInterface
 {

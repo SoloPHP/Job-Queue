@@ -1,7 +1,7 @@
 {
   "name": "solophp/job-queue",
   "type": "library",
-  "description": "A lightweight and reliable database-backed job queue for PHP with atomic claim, visibility timeout, and exponential backoff.",
+  "description": "Database-backed job queue for PHP: leased claims with ownership tokens, persisted retry policies and a worker daemon on Doctrine DBAL.",
   "keywords": [
     "php",
     "queue",
@@ -30,7 +30,7 @@
     "php": ">=8.3",
     "ext-mbstring": "*",
     "doctrine/dbal": "^4.0",
-    "solophp/contracts": "^1.8",
+    "solophp/contracts": "^1.9",
     "psr/container": "^1.0|^2.0",
     "psr/log": "^1.0|^2.0|^3.0",
     "psr/clock": "^1.0"

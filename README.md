@@ -14,8 +14,9 @@ composer require solophp/job-queue
 
 ```php
 use Doctrine\DBAL\DriverManager;
-use Solo\JobQueue\{ContainerJobCodec, JobQueue, RetryPolicy, Schema};
-use Solo\JobQueue\Storage\DbalJobStorage;
+use Solo\JobQueue\{JobQueue, RetryPolicy};
+use Solo\JobQueue\Codec\ContainerJobCodec;
+use Solo\JobQueue\Storage\{DbalJobStorage, Schema};
 
 $connection = DriverManager::getConnection([
     'driver' => 'pdo_mysql',
@@ -42,15 +43,25 @@ Creating the storage or the queue does not open a database connection; the first
 
 Retry settings are stored **with each job when it is enqueued**. Consumer configuration cannot shorten another job's lease or change its attempt budget. `maxAttempts` includes the first execution. Delays after failed attempts are `baseDelay`, `2 * baseDelay`, etc., capped by `maxDelay`. Lease timeout is separate from retry policy.
 
-`JobQueue` implements two narrow interfaces. Type-hint `JobProducerInterface` (`push()`/`pushMany()`) in services that only enqueue: unlike the final `JobQueue`, it is easy to mock. `JobProcessorInterface` covers execution and is what `Worker` uses.
+`JobQueue` implements two narrow interfaces from `solophp/contracts`. Type-hint `Solo\Contracts\JobQueue\JobProducerInterface` (`push()`/`pushMany()`) in services that only enqueue: unlike the final `JobQueue`, it is easy to mock, and integrations need only the contracts package. `JobProcessorInterface` covers execution and is what `Worker` uses.
 
 The codec converts jobs to JSON and back. `ContainerJobCodec` restores dependencies through a PSR-11 container, so it needs one in producers too. For custom serialization and construction, implement the two-method `JobCodecInterface` and pass it as `codec`. Its `encode()` must return valid JSON for the database JSON/JSONB column; the queue validates this before insertion.
+
+## Package layout
+
+| Namespace | Contents |
+| --- | --- |
+| `Solo\JobQueue` | `JobQueue` and its value types: `ClaimedJob`, `JobRecord`, `JobStatus`, `RetryPolicy` |
+| `Solo\JobQueue\Codec` | `JobCodecInterface`, `ContainerJobCodec`, `PersistableJobInterface` |
+| `Solo\JobQueue\Storage` | `DbalJobStorage` and `Schema` for MySQL, MariaDB, PostgreSQL, and SQLite |
+| `Solo\JobQueue\Worker` | The `Worker` daemon and its `WorkerLimits` |
+| `Solo\Contracts\JobQueue` | `JobInterface`, `JobProducerInterface`, `JobProcessorInterface`, `JobQueueListener` (package `solophp/contracts`) |
 
 ## Define a job
 
 ```php
 use Psr\Container\ContainerInterface;
-use Solo\JobQueue\PersistableJobInterface;
+use Solo\JobQueue\Codec\PersistableJobInterface;
 
 final class SendEmailJob implements PersistableJobInterface
 {
@@ -78,7 +89,7 @@ final class SendEmailJob implements PersistableJobInterface
 }
 ```
 
-`ContainerJobCodec` accepts only `PersistableJobInterface` jobs, both when enqueueing and when restoring them; the stored class name must implement it too. Job classes written for v1 already have both methods: add `implements PersistableJobInterface`.
+`ContainerJobCodec` accepts only `PersistableJobInterface` jobs, both when enqueueing and when restoring them; the stored class name must implement it too. Job classes written for v1 usually need only `implements PersistableJobInterface`; [UPGRADING.md](UPGRADING.md) lists the required signatures.
 
 The codec keeps the v1 `{job_class, job_data}` JSON format, so queued v1 payloads remain readable; a payload without `job_data` restores with an empty array. Keep old job classes loadable until their queued jobs have drained. Applications needing stable aliases or payload versions can provide their own codec without changing storage.
 
@@ -165,7 +176,7 @@ All application-supplied dates are normalized to UTC. Keep clocks synchronized b
 ## Worker daemon
 
 ```php
-use Solo\JobQueue\{Worker, WorkerLimits};
+use Solo\JobQueue\Worker\{Worker, WorkerLimits};
 
 $worker = new Worker(
     queue: $queue,
@@ -193,7 +204,7 @@ Maintenance recovers up to 100 attempts whose lease expired, applying each job's
 
 Implement `Solo\Contracts\JobQueue\JobQueueListener` for `onClaimed`, `onCompleted`, `onFailed`, and `onReclaimed`. Each `onClaimed` is followed by `onCompleted` or `onFailed` for that attempt, unless maintenance reclaimed the job first; `onReclaimed` then reports aggregate counts, and its second argument includes recovered attempts that expired. A payload that cannot be decoded produces `onFailed` without `onClaimed`. The `permanent` flag means no automatic retry, including expiry. Keep observers cheap and non-throwing. Throwable failures reach PSR-3 loggers under the `exception` key; maintenance logs reclaimed and expired jobs as warnings.
 
-`JobStorageInterface` is internal and may change in any 2.x release: construct `DbalJobStorage` and pass it to `JobQueue`. The old broad `Solo\Contracts\JobQueue\JobQueueInterface` is not implemented; adapters using it need updating to `JobProducerInterface` and `JobProcessorInterface`.
+`JobStorageInterface` is internal and may change in any 2.x release: construct `DbalJobStorage` and pass it to `JobQueue`. The deprecated `Solo\Contracts\JobQueue\JobQueueInterface` is not implemented; adapters using it need updating to `JobProducerInterface` and `JobProcessorInterface` from the same package.
 
 ## Testing
 

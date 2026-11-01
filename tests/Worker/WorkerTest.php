@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Worker;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
-use Solo\JobQueue\JobProcessorInterface;
-use Solo\JobQueue\Worker;
-use Solo\JobQueue\WorkerLimits;
+use Solo\Contracts\JobQueue\JobProcessorInterface;
+use Solo\JobQueue\Worker\Worker;
+use Solo\JobQueue\Worker\WorkerLimits;
 
 final class WorkerTest extends TestCase
 {

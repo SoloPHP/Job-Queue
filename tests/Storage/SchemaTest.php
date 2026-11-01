@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Storage;
 
 use DateTimeImmutable;
 use Doctrine\DBAL\Connection;
@@ -14,8 +14,8 @@ use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Solo\JobQueue\RetryPolicy;
-use Solo\JobQueue\Schema;
 use Solo\JobQueue\Storage\DbalJobStorage;
+use Solo\JobQueue\Storage\Schema;
 
 final class SchemaTest extends TestCase
 {

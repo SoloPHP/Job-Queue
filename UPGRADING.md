@@ -1,15 +1,16 @@
 # Upgrading from v1 to v2
 
-v2 changes the schema and public execution API. Upgrade producers, workers, and integrations together. PHP 8.3 remains the minimum; the `mbstring` extension is now required.
+v2 changes the schema and public execution API. Upgrade producers, workers, and integrations together. PHP 8.3 remains the minimum; the `mbstring` extension and `solophp/contracts` 1.9 are now required.
 
 ## Deployment and schema
 
 1. Stop all producers, workers, and maintenance processes using the table. Let active jobs finish where possible. Back up the table.
-2. Deploy v2 code while the queue remains stopped. Job classes must already implement `PersistableJobInterface` (see below). Use an autocommit connection with no active transaction.
+2. Deploy v2 code while the queue remains stopped. Job classes must already implement `Solo\JobQueue\Codec\PersistableJobInterface` (see below). Use an autocommit connection with no active transaction.
 3. Run the explicit migration once, specifying the policy for existing jobs:
 
    ```php
-   use Solo\JobQueue\{RetryPolicy, Schema};
+   use Solo\JobQueue\RetryPolicy;
+   use Solo\JobQueue\Storage\Schema;
 
    Schema::migrate(
        $connection,
@@ -34,6 +35,7 @@ The migration adds `claim_token`, `lease_until`, `finished_at`, and saved retry 
 
 | v1 | v2 |
 | --- | --- |
+| `Solo\JobQueue\Schema`, `Worker`, `WorkerLimits` | Moved to `Solo\JobQueue\Storage\Schema`, `Solo\JobQueue\Worker\Worker`, and `Solo\JobQueue\Worker\WorkerLimits` |
 | `new RetryPolicy(maxRetries: 3, lockTimeout: 600)` | `new RetryPolicy(maxAttempts: 3)`, plus `JobQueue(leaseDuration: 600)` |
 | First delay `2 * baseDelay` | First delay `baseDelay`; then doubles to `maxDelay` |
 | Retry policy on each consumer | Policy saved when each job is enqueued |
@@ -49,7 +51,7 @@ The migration adds `claim_token`, `lease_until`, `finished_at`, and saved retry 
 | Four statistics statuses | Five statuses, including `expired` |
 | `retry($id)` on a failed expired job | Returns false; provide `expiresAt` with a future deadline |
 | No history cleanup | `prune($finishedBefore, $statuses)` deletes finished jobs |
-| External broad `JobQueueInterface` | `JobProducerInterface` for enqueueing, `JobProcessorInterface` for execution; `JobQueue` implements both |
+| `Solo\Contracts\JobQueue\JobQueueInterface` | Deprecated in `solophp/contracts` 1.9; `JobQueue` implements `JobProducerInterface` for enqueueing and `JobProcessorInterface` for execution from the same namespace |
 | `WorkerLimits::reachedReason($count, $unixStartedAt)` | `reachedReason($count, $elapsedSeconds)` |
 | `LockGuard` | Removed; use `flock()` directly or a lock library such as `symfony/lock` |
 
@@ -65,7 +67,7 @@ The standard codec still reads `{job_class, job_data}` and tolerates an absent `
 
 Explicit non-array job data is rejected. Legacy jobs already stored with missing data cannot have that data recovered automatically; inspect or recreate them before rollout.
 
-Integrations accepting `Solo\Contracts\JobQueue\JobQueueInterface`, including older async-event-dispatcher queue adapters, must be updated before switching to v2. Use `JobProcessorInterface` when only processing is needed and `JobProducerInterface` when enqueueing is needed. No changes to the separate `solophp/contracts` package are required; `JobInterface` and `JobQueueListener` remain in use.
+Integrations accepting `Solo\Contracts\JobQueue\JobQueueInterface`, including older async-event-dispatcher queue adapters, must be updated before switching to v2. Use `Solo\Contracts\JobQueue\JobProcessorInterface` when only processing is needed and `JobProducerInterface` when enqueueing is needed. Both ship with `solophp/contracts` 1.9, so adapters do not have to depend on this package. `JobInterface` and `JobQueueListener` are unchanged.
 
 ## Operational changes
 

@@ -6,7 +6,7 @@ namespace Solo\JobQueue\Tests\Fixtures;
 
 use Psr\Container\ContainerInterface;
 use RuntimeException;
-use Solo\JobQueue\PersistableJobInterface;
+use Solo\JobQueue\Codec\PersistableJobInterface;
 
 /** Fails with a message no database accepts verbatim: invalid UTF-8, a NUL byte, 70 KB. */
 final class UnstorableErrorJob implements PersistableJobInterface

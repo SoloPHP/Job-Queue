@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue;
+namespace Solo\JobQueue\Codec;
 
 use InvalidArgumentException;
 use Psr\Container\ContainerInterface;

@@ -2,18 +2,19 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Storage;
 
 use DateTimeImmutable;
 use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use RuntimeException;
-use Solo\JobQueue\{JobQueue, RetryPolicy, Schema};
-use Solo\JobQueue\Storage\DbalJobStorage;
+use Solo\JobQueue\{JobQueue, RetryPolicy};
+use Solo\JobQueue\Storage\{DbalJobStorage, Schema};
 use Solo\JobQueue\Tests\Fixtures\SimpleJob;
+use Solo\JobQueue\Tests\Support\DatabaseTestCase;
 
 /** Runs legacy schema upgrades on every real database in the integration matrix. */
-final class MigrationTest extends QueueTestCase
+final class MigrationTest extends DatabaseTestCase
 {
     private string $indexPrefix;
 

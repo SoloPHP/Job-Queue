@@ -2,23 +2,21 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Support;
 
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\DriverManager;
 use Doctrine\DBAL\Platforms\SQLitePlatform;
 use PHPUnit\Framework\TestCase;
-use Solo\JobQueue\ContainerJobCodec;
-use Solo\JobQueue\Schema;
+use Solo\JobQueue\Codec\ContainerJobCodec;
 use Solo\JobQueue\Storage\DbalJobStorage;
-use Solo\JobQueue\Tests\Fixtures\ArrayContainer;
-use Solo\JobQueue\Tests\Fixtures\Recorder;
+use Solo\JobQueue\Storage\Schema;
 
 /**
  * Common test scaffolding: in-memory SQLite (or the QUEUE_TEST_* database) + installed
  * schema + ready-to-use DbalJobStorage. Concrete test cases compose `JobQueue` / `Worker` on top.
  */
-abstract class QueueTestCase extends TestCase
+abstract class DatabaseTestCase extends TestCase
 {
     protected Connection $connection;
     protected DbalJobStorage $storage;

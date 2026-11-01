@@ -6,11 +6,15 @@ namespace Solo\JobQueue;
 
 use DateTimeImmutable;
 use DateTimeInterface;
+use DateTimeZone;
 use InvalidArgumentException;
 use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
 use Solo\Contracts\JobQueue\JobInterface;
+use Solo\Contracts\JobQueue\JobProcessorInterface;
+use Solo\Contracts\JobQueue\JobProducerInterface;
 use Solo\Contracts\JobQueue\JobQueueListener;
+use Solo\JobQueue\Codec\JobCodecInterface;
 use Solo\JobQueue\Storage\JobStorageInterface;
 use Throwable;
 
@@ -45,7 +49,12 @@ final readonly class JobQueue implements JobProducerInterface, JobProcessorInter
             throw new InvalidArgumentException('leaseDuration must be positive.');
         }
         $this->retry = $retry ?? new RetryPolicy();
-        $this->clock = $clock ?? new SystemClock();
+        $this->clock = $clock ?? new class implements ClockInterface {
+            public function now(): DateTimeImmutable
+            {
+                return new DateTimeImmutable('now', new DateTimeZone('UTC'));
+            }
+        };
     }
 
     public function push(

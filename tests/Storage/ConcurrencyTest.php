@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Storage;
 
 use DateTimeImmutable;
 use Doctrine\DBAL\Connection;
@@ -11,10 +11,11 @@ use Doctrine\DBAL\Platforms\SQLitePlatform;
 use RuntimeException;
 use Solo\JobQueue\RetryPolicy;
 use Solo\JobQueue\Storage\DbalJobStorage;
+use Solo\JobQueue\Tests\Support\DatabaseTestCase;
 use Throwable;
 
 /** Exercises real independent database connections, including SQLite file locks. */
-final class ConcurrencyTest extends QueueTestCase
+final class ConcurrencyTest extends DatabaseTestCase
 {
     private DateTimeImmutable $now;
     private DateTimeImmutable $leaseUntil;

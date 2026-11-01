@@ -2,11 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests\Fixtures;
+namespace Solo\JobQueue\Tests\Support;
 
 use Closure;
 use Solo\Contracts\JobQueue\JobInterface;
-use Solo\JobQueue\JobCodecInterface;
+use Solo\JobQueue\Codec\JobCodecInterface;
+use Solo\JobQueue\Tests\Fixtures\CallbackJob;
 
 /** Every decoded job runs the same callback; the payload is ignored. */
 final readonly class CallbackCodec implements JobCodecInterface

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests\Fixtures;
+namespace Solo\JobQueue\Tests\Support;
 
 use DateTimeImmutable;
 use Psr\Clock\ClockInterface;

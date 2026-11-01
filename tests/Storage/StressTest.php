@@ -2,17 +2,18 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Storage;
 
 use DateTimeImmutable;
 use Doctrine\DBAL\Platforms\SQLitePlatform;
 use Solo\JobQueue\RetryPolicy;
+use Solo\JobQueue\Tests\Support\DatabaseTestCase;
 
 /**
  * Several worker processes drain one queue at once. With REPEATABLE READ gap locks, MySQL and
  * MariaDB used to deadlock concurrent claims here within seconds.
  */
-final class StressTest extends QueueTestCase
+final class StressTest extends DatabaseTestCase
 {
     private const WORKERS = 4;
     private const JOBS = 1200;
@@ -39,7 +40,7 @@ final class StressTest extends QueueTestCase
             $errors = tmpfile();
             $this->assertIsResource($errors);
             $process = proc_open(
-                [PHP_BINARY, __DIR__ . '/Fixtures/stress-worker.php'],
+                [PHP_BINARY, dirname(__DIR__) . '/Support/stress-worker.php'],
                 [1 => ['pipe', 'w'], 2 => $errors],
                 $pipes,
                 null,

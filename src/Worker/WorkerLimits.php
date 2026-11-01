@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue;
+namespace Solo\JobQueue\Worker;
 
 use InvalidArgumentException;
 

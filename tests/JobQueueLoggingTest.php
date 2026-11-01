@@ -9,12 +9,13 @@ use RuntimeException;
 use Solo\JobQueue\JobQueue;
 use Solo\JobQueue\RetryPolicy;
 use Solo\JobQueue\Tests\Fixtures\FailingJob;
-use Solo\JobQueue\Tests\Fixtures\FrozenClock;
 use Solo\JobQueue\Tests\Fixtures\SimpleJob;
-use Solo\JobQueue\Tests\Fixtures\SpyLogger;
+use Solo\JobQueue\Tests\Support\DatabaseTestCase;
+use Solo\JobQueue\Tests\Support\FrozenClock;
+use Solo\JobQueue\Tests\Support\SpyLogger;
 use Stringable;
 
-final class LoggerInteractionTest extends QueueTestCase
+final class JobQueueLoggingTest extends DatabaseTestCase
 {
     private SpyLogger $logger;
 

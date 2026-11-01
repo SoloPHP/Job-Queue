@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Solo\JobQueue\Tests;
+namespace Solo\JobQueue\Tests\Storage;
 
 use DateTimeImmutable;
 use Doctrine\DBAL\Connection;
@@ -13,8 +13,9 @@ use Solo\JobQueue\ClaimedJob;
 use Solo\JobQueue\JobStatus;
 use Solo\JobQueue\RetryPolicy;
 use Solo\JobQueue\Storage\DbalJobStorage;
+use Solo\JobQueue\Tests\Support\DatabaseTestCase;
 
-final class StorageTest extends QueueTestCase
+final class DbalJobStorageTest extends DatabaseTestCase
 {
     public function testClaimStartsOneAttemptAndPersistsTheProducerPolicy(): void
     {

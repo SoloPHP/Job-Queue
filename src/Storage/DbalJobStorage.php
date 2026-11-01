@@ -16,7 +16,6 @@ use Solo\JobQueue\ClaimedJob;
 use Solo\JobQueue\JobRecord;
 use Solo\JobQueue\JobStatus;
 use Solo\JobQueue\RetryPolicy;
-use Solo\JobQueue\Schema;
 
 /**
  * Doctrine DBAL persistence. Consumer transitions are single conditional statements fenced by
