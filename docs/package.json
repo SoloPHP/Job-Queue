@@ -1,0 +1,13 @@
+{
+  "name": "solo-job-queue-docs",
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}
