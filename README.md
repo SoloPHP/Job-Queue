@@ -45,7 +45,7 @@ Retry settings are stored **with each job when it is enqueued**. Consumer config
 
 `JobQueue` implements two narrow interfaces from `solophp/contracts`. Type-hint `Solo\Contracts\JobQueue\JobProducerInterface` (`push()`/`pushMany()`) in services that only enqueue: unlike the final `JobQueue`, it is easy to mock, and integrations need only the contracts package. `JobProcessorInterface` covers execution and is what `Worker` uses.
 
-The codec converts jobs to JSON and back. `ContainerJobCodec` restores dependencies through a PSR-11 container, so it needs one in producers too. For custom serialization and construction, implement the two-method `JobCodecInterface` and pass it as `codec`. Its `encode()` must return valid JSON for the database JSON/JSONB column; the queue validates this before insertion.
+The codec converts jobs to JSON and back. `ContainerJobCodec` restores dependencies through a PSR-11 container, so it needs one in producers too. For custom serialization and construction, implement the two-method `JobCodecInterface` and pass it as `codec`. Its `encode()` must return valid JSON for the database JSON/JSONB column; the queue validates this before insertion. PostgreSQL JSONB additionally rejects the `\u0000` escape, so keep NUL characters out of job data (encode binary values, for example with base64).
 
 ## Package layout
 

@@ -46,7 +46,6 @@ final class Schema
      */
     public static function quoteTable(Connection $connection, string $table): string
     {
-        self::assertValidTableName($table);
         self::assertSupportedPlatform($connection);
         return self::quote($connection, self::fold($connection, $table));
     }
