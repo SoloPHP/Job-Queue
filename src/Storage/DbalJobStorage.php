@@ -377,11 +377,7 @@ final class DbalJobStorage implements JobStorageInterface
     /** Resolved on first use: detecting the platform may open a connection. */
     private function table(): string
     {
-        if ($this->quotedTable === null) {
-            Schema::assertSupportedPlatform($this->connection);
-            $this->quotedTable = $this->connection->getDatabasePlatform()->quoteSingleIdentifier($this->table);
-        }
-        return $this->quotedTable;
+        return $this->quotedTable ??= Schema::quoteTable($this->connection, $this->table);
     }
 
     /** @return list<int|string|null> */

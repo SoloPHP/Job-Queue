@@ -9,6 +9,7 @@ use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use RuntimeException;
 use Solo\JobQueue\{JobQueue, RetryPolicy, Schema};
+use Solo\JobQueue\Storage\DbalJobStorage;
 use Solo\JobQueue\Tests\Fixtures\SimpleJob;
 
 /** Runs legacy schema upgrades on every real database in the integration matrix. */
@@ -20,33 +21,7 @@ final class MigrationTest extends QueueTestCase
     {
         parent::setUp();
         $this->connection->executeStatement('DROP TABLE jobs');
-        $platform = $this->connection->getDatabasePlatform();
-        $mysql = $platform instanceof AbstractMySQLPlatform;
-        $postgres = $platform instanceof PostgreSQLPlatform;
-        $id = match (true) {
-            $mysql => 'BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY',
-            $postgres => 'BIGSERIAL PRIMARY KEY',
-            default => 'INTEGER PRIMARY KEY AUTOINCREMENT',
-        };
-        $payload = $mysql ? 'JSON' : ($postgres ? 'JSONB' : 'TEXT');
-        $date = $postgres ? 'TIMESTAMP' : 'DATETIME';
-        $created = $mysql ? 'TIMESTAMP' : $date;
-        $status = $mysql ? "ENUM('pending','in_progress','completed','failed')" : 'VARCHAR(20)';
-        $this->connection->executeStatement("CREATE TABLE jobs (
-            id {$id}, name VARCHAR(255) NOT NULL, type VARCHAR(64) NOT NULL DEFAULT 'default',
-            payload {$payload} NOT NULL, status {$status} NOT NULL DEFAULT 'pending',
-            retry_count INTEGER NOT NULL DEFAULT 0, error TEXT NULL, scheduled_at {$date} NOT NULL,
-            locked_at {$date} NULL, expires_at {$date} NULL,
-            created_at {$created} NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )" . ($mysql ? ' ENGINE=InnoDB' : ''));
-        // The indexes exactly as v1 created them: per-table names on MySQL, prefixed elsewhere.
-        $this->indexPrefix = $mysql ? 'idx_' : 'idx_jobs_';
-        $p = $this->indexPrefix;
-        $this->connection->executeStatement("CREATE INDEX {$p}status_scheduled ON jobs (status, scheduled_at)");
-        $this->connection->executeStatement(
-            "CREATE INDEX {$p}type_status_scheduled ON jobs (type, status, scheduled_at)",
-        );
-        $this->connection->executeStatement("CREATE INDEX {$p}locked_at ON jobs (locked_at)");
+        $this->indexPrefix = $this->createV1Table('jobs');
     }
 
     public function testLegacyPayloadsAndAttemptHistorySurviveMigrationAndRerun(): void
@@ -139,6 +114,61 @@ final class MigrationTest extends QueueTestCase
         $this->assertSame('pending', $row['status']);
         $this->assertNull($row['finished_at']);
         $this->assertIndexesMatchTheV2Definition();
+    }
+
+    public function testLongMixedCaseTableNameKeepsAddressingTheTableV1Created(): void
+    {
+        // PostgreSQL folded v1's unquoted name to lower case and truncated its index names to 63 bytes.
+        $table = 'Legacy_' . str_repeat('queue_', 6);
+        $this->connection->executeStatement("DROP TABLE IF EXISTS {$table}");
+        try {
+            $this->createV1Table($table);
+            Schema::migrate($this->connection, new RetryPolicy(), $table);
+            Schema::install($this->connection, $table);
+
+            $storage = new DbalJobStorage($this->connection, $table);
+            $now = new DateTimeImmutable('2030-01-01 00:00:00 UTC');
+            $id = $storage->insert('job', 'default', '{}', $now, null, new RetryPolicy(), $now);
+            $claim = $storage->claim(null, $now, $now->modify('+1 minute'));
+            $this->assertNotNull($claim);
+            $this->assertSame($id, $claim->id);
+            $this->assertTrue($storage->complete($claim, $now, false));
+            $this->assertSame(1, (int) $this->connection->fetchOne("SELECT COUNT(*) FROM {$table}"));
+        } finally {
+            $this->connection->executeStatement("DROP TABLE IF EXISTS {$table}");
+        }
+    }
+
+    /** Creates a table and its indexes exactly as v1 did, with unquoted names; returns the index prefix. */
+    private function createV1Table(string $table): string
+    {
+        $platform = $this->connection->getDatabasePlatform();
+        $mysql = $platform instanceof AbstractMySQLPlatform;
+        $postgres = $platform instanceof PostgreSQLPlatform;
+        $id = match (true) {
+            $mysql => 'BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY',
+            $postgres => 'BIGSERIAL PRIMARY KEY',
+            default => 'INTEGER PRIMARY KEY AUTOINCREMENT',
+        };
+        $payload = $mysql ? 'JSON' : ($postgres ? 'JSONB' : 'TEXT');
+        $date = $postgres ? 'TIMESTAMP' : 'DATETIME';
+        $created = $mysql ? 'TIMESTAMP' : $date;
+        $status = $mysql ? "ENUM('pending','in_progress','completed','failed')" : 'VARCHAR(20)';
+        $this->connection->executeStatement("CREATE TABLE {$table} (
+            id {$id}, name VARCHAR(255) NOT NULL, type VARCHAR(64) NOT NULL DEFAULT 'default',
+            payload {$payload} NOT NULL, status {$status} NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0, error TEXT NULL, scheduled_at {$date} NOT NULL,
+            locked_at {$date} NULL, expires_at {$date} NULL,
+            created_at {$created} NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )" . ($mysql ? ' ENGINE=InnoDB' : ''));
+        // Per-table index names on MySQL, prefixed elsewhere.
+        $p = $mysql ? 'idx_' : "idx_{$table}_";
+        $this->connection->executeStatement("CREATE INDEX {$p}status_scheduled ON {$table} (status, scheduled_at)");
+        $this->connection->executeStatement(
+            "CREATE INDEX {$p}type_status_scheduled ON {$table} (type, status, scheduled_at)",
+        );
+        $this->connection->executeStatement("CREATE INDEX {$p}locked_at ON {$table} (locked_at)");
+        return $p;
     }
 
     private function assertIndexesMatchTheV2Definition(): void

@@ -19,6 +19,10 @@ final class Schema
     private const REQUIRED_COLUMNS = [
         'attempts', 'claim_token', 'lease_until', 'max_attempts', 'base_delay', 'max_delay', 'finished_at',
     ];
+    /** v1 columns; migrate() removes them only after converting their data. */
+    private const LEGACY_COLUMNS = ['retry_count', 'locked_at'];
+    /** PostgreSQL truncates longer identifiers. */
+    private const POSTGRES_NAME_BYTES = 63;
     /** Index suffix => columns: the one definition used by install() and migrate(). */
     private const INDEXES = [
         'status_scheduled' => ['status', 'scheduled_at', 'id'],
@@ -35,8 +39,18 @@ final class Schema
         }
     }
 
-    /** @internal */
-    public static function assertSupportedPlatform(Connection $connection): void
+    /**
+     * @internal The table as SQL addresses it. v1 interpolated names unquoted, which PostgreSQL
+     * folds to lower case; quoting the folded name keeps addressing the same relation.
+     */
+    public static function quoteTable(Connection $connection, string $table): string
+    {
+        self::assertValidTableName($table);
+        self::assertSupportedPlatform($connection);
+        return self::quote($connection, self::fold($connection, $table));
+    }
+
+    private static function assertSupportedPlatform(Connection $connection): void
     {
         $platform = $connection->getDatabasePlatform();
         if (
@@ -55,15 +69,17 @@ final class Schema
     {
         self::assertValidTableName($table);
         self::assertSupportedPlatform($connection);
+        $table = self::fold($connection, $table);
+        $indexes = self::indexes($connection, $table);
         $manager = $connection->createSchemaManager();
         if ($manager->tablesExist([$table])) {
-            $columns = $manager->listTableColumns($table);
-            foreach (self::REQUIRED_COLUMNS as $column) {
-                if (!isset($columns[$column])) {
-                    throw new RuntimeException(
-                        'Outdated queue schema detected. Stop workers and run Schema::migrate().',
-                    );
-                }
+            // Legacy columns also mark a MySQL migration interrupted after adding the new ones.
+            $columns = array_keys($manager->listTableColumns($table));
+            if (
+                array_diff(self::REQUIRED_COLUMNS, $columns) !== []
+                || array_intersect(self::LEGACY_COLUMNS, $columns) !== []
+            ) {
+                throw new RuntimeException('Outdated queue schema detected. Stop workers and run Schema::migrate().');
             }
         }
         $platform = $connection->getDatabasePlatform();
@@ -102,7 +118,7 @@ final class Schema
                 created_at {$timestamp} NOT NULL DEFAULT {$createdDefault}
             ){$suffix}",
         );
-        self::installIndexes($connection, $table);
+        self::installIndexes($connection, $table, $indexes);
     }
 
     /**
@@ -123,12 +139,14 @@ final class Schema
         if ($connection->isTransactionActive() || !$connection->isAutoCommit()) {
             throw new RuntimeException('Queue schema migration requires autocommit without an active transaction.');
         }
+        $table = self::fold($connection, $table);
+        $indexes = self::indexes($connection, $table);
         if (!$connection->createSchemaManager()->tablesExist([$table])) {
             self::install($connection, $table);
             return;
         }
         $mysql = $connection->getDatabasePlatform() instanceof AbstractMySQLPlatform;
-        $migration = static function () use ($connection, $legacyPolicy, $table, $mysql): void {
+        $migration = static function () use ($connection, $legacyPolicy, $table, $indexes, $mysql): void {
             $quotedTable = self::quote($connection, $table);
             $columns = $connection->createSchemaManager()->listTableColumns($table);
             $timestamp = $connection->getDatabasePlatform() instanceof PostgreSQLPlatform ? 'TIMESTAMP' : 'DATETIME';
@@ -196,12 +214,12 @@ final class Schema
                     );
                 }
             }
-            foreach (['retry_count', 'locked_at'] as $legacyColumn) {
+            foreach (self::LEGACY_COLUMNS as $legacyColumn) {
                 if (isset($columns[$legacyColumn])) {
                     $connection->executeStatement("ALTER TABLE {$quotedTable} DROP COLUMN {$legacyColumn}");
                 }
             }
-            self::installIndexes($connection, $table);
+            self::installIndexes($connection, $table, $indexes);
         };
         if ($mysql) {
             $migration();
@@ -210,15 +228,40 @@ final class Schema
         }
     }
 
-    /** Create missing indexes and rebuild those whose columns differ from the definition. */
-    private static function installIndexes(Connection $connection, string $table): void
+    /**
+     * Index name => columns. MySQL index names are per table; elsewhere they share one namespace
+     * per schema. PostgreSQL names are truncated as PostgreSQL truncated the v1 index names.
+     *
+     * @return array<string, list<string>>
+     */
+    private static function indexes(Connection $connection, string $table): array
+    {
+        $platform = $connection->getDatabasePlatform();
+        $indexes = [];
+        foreach (self::INDEXES as $suffix => $columns) {
+            $name = $platform instanceof AbstractMySQLPlatform ? 'idx_' . $suffix : 'idx_' . $table . '_' . $suffix;
+            $indexes[$platform instanceof PostgreSQLPlatform ? substr($name, 0, self::POSTGRES_NAME_BYTES) : $name]
+                = $columns;
+        }
+        if (count($indexes) !== count(self::INDEXES)) {
+            throw new InvalidArgumentException(
+                sprintf('Table name "%s" is too long for distinct PostgreSQL index names.', $table),
+            );
+        }
+        return $indexes;
+    }
+
+    /**
+     * Create missing indexes and rebuild those whose columns differ from the definition.
+     *
+     * @param array<string, list<string>> $indexes
+     */
+    private static function installIndexes(Connection $connection, string $table, array $indexes): void
     {
         $mysql = $connection->getDatabasePlatform() instanceof AbstractMySQLPlatform;
         $existing = $connection->createSchemaManager()->listTableIndexes($table);
         $quotedTable = self::quote($connection, $table);
-        foreach (self::INDEXES as $suffix => $columns) {
-            // MySQL index names are per table; elsewhere they share one namespace per schema.
-            $name = $mysql ? 'idx_' . $suffix : 'idx_' . $table . '_' . $suffix;
+        foreach ($indexes as $name => $columns) {
             $index = $existing[strtolower($name)] ?? null;
             if ($index !== null && $index->getColumns() === $columns) {
                 continue;
@@ -237,5 +280,10 @@ final class Schema
     private static function quote(Connection $connection, string $identifier): string
     {
         return $connection->getDatabasePlatform()->quoteSingleIdentifier($identifier);
+    }
+
+    private static function fold(Connection $connection, string $identifier): string
+    {
+        return $connection->getDatabasePlatform() instanceof PostgreSQLPlatform ? strtolower($identifier) : $identifier;
     }
 }

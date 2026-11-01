@@ -127,7 +127,7 @@ $queue->processNext('email');     // One attempt, no maintenance; false when not
 
 `processJobs()` runs maintenance once, then claims **one job immediately before execution**, up to the requested limit. Other jobs remain available to other workers. Claiming increments `attempts` and stores a random token plus `lease_until`. Completion, failure, and deletion require the current token; renewal also requires an unexpired lease.
 
-PostgreSQL and SQLite claim with one atomic `UPDATE … RETURNING` statement (selecting the row with `FOR UPDATE SKIP LOCKED` on PostgreSQL). MySQL/MariaDB use a short `SELECT … FOR UPDATE SKIP LOCKED` transaction that always runs at READ COMMITTED: under REPEATABLE READ, gap locks on the status index make concurrent claims deadlock. Consumer statements aborted by a deadlock, a lock wait timeout, or a busy SQLite database are retried up to five times. Configure SQLite `busy_timeout` for your workload; persistent database errors propagate to the caller.
+PostgreSQL and SQLite claim with one atomic `UPDATE … RETURNING` statement (selecting the row with `FOR UPDATE SKIP LOCKED` on PostgreSQL). MySQL/MariaDB use a short `SELECT … FOR UPDATE SKIP LOCKED` transaction that always runs at READ COMMITTED: under REPEATABLE READ, gap locks on the status index make concurrent claims deadlock. With binary logging enabled, the server must use `binlog_format` ROW or MIXED (the MySQL and MariaDB defaults); `STATEMENT` rejects InnoDB writes at READ COMMITTED. Consumer statements aborted by a deadlock, a lock wait timeout, or a busy SQLite database are retried up to five times. Configure SQLite `busy_timeout` for your workload; persistent database errors propagate to the caller.
 
 Consumer operations require an autocommit connection with no active transaction. Handlers execute outside the claim transaction. Use a dedicated worker connection if your application's connection may be inside a transaction. Handlers must finish any transactions they start before returning.
 
@@ -136,11 +136,10 @@ The default lease is 600 seconds. Choose a duration longer than the longest unin
 ```php
 $claim = $queue->claim('import');
 if ($claim !== null) {
-    $job = $codec->decode($claim->payload);
     // A custom execution loop can call $claim = $queue->renew($claim) between bounded work units.
     // Stop working when renew() returns null: the lease ended or another attempt took over.
     try {
-        $job->handle();
+        $codec->decode($claim->payload)->handle();
     } catch (Throwable $error) {
         $queue->fail($claim, $error);
         throw $error;

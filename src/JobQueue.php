@@ -226,7 +226,11 @@ final readonly class JobQueue implements JobProducerInterface, JobProcessorInter
         if ($expiresAt !== null && $expiresAt <= $now) {
             return false;
         }
-        return $this->storage->retry($jobId, $now, $expiresAt);
+        if (!$this->storage->retry($jobId, $now, $expiresAt)) {
+            return false;
+        }
+        $this->log('info', 'Job re-queued', ['id' => $jobId]);
+        return true;
     }
 
     /** @return list<JobRecord> Ready jobs in claim order; an informational read that claims nothing. */

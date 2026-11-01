@@ -19,7 +19,7 @@ A rewrite with a new schema and execution API. Read [UPGRADING.md](UPGRADING.md)
 
 ### Changed
 
-- MySQL/MariaDB claims run at READ COMMITTED, so concurrent workers no longer deadlock.
+- MySQL/MariaDB claims run at READ COMMITTED, so concurrent workers no longer deadlock. Servers with binary logging need `binlog_format` ROW or MIXED.
 - Consumer statements aborted by deadlocks, lock wait timeouts or busy SQLite databases are retried.
 - Expiry maintenance uses a `(status, expires_at)` index instead of scanning every pending job.
 - Attempts can be acknowledged after their lease ended, until maintenance reclaims them.

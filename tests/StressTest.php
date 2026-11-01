@@ -35,24 +35,28 @@ final class StressTest extends QueueTestCase
         $env = ['QUEUE_STRESS_PARAMS' => json_encode($this->connection->getParams(), JSON_THROW_ON_ERROR)] + getenv();
         $workers = [];
         for ($i = 0; $i < self::WORKERS; ++$i) {
+            // A file, not a pipe: an unread stderr pipe could fill up and block the worker.
+            $errors = tmpfile();
+            $this->assertIsResource($errors);
             $process = proc_open(
                 [PHP_BINARY, __DIR__ . '/Fixtures/stress-worker.php'],
-                [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                [1 => ['pipe', 'w'], 2 => $errors],
                 $pipes,
                 null,
                 $env,
             );
             $this->assertIsResource($process);
-            $workers[] = [$process, $pipes];
+            $workers[] = [$process, $pipes[1], $errors];
         }
 
         $executed = [];
-        foreach ($workers as [$process, $pipes]) {
-            $output = (string) stream_get_contents($pipes[1]);
-            $errors = (string) stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            $this->assertSame(0, proc_close($process), $output . $errors);
+        foreach ($workers as [$process, $stdout, $errors]) {
+            $output = (string) stream_get_contents($stdout);
+            fclose($stdout);
+            $exitCode = proc_close($process);
+            rewind($errors);
+            $this->assertSame(0, $exitCode, $output . stream_get_contents($errors));
+            fclose($errors);
             /** @var list<int> $numbers */
             $numbers = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
             array_push($executed, ...$numbers);

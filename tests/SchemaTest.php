@@ -10,6 +10,7 @@ use Doctrine\DBAL\DriverManager;
 use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Solo\JobQueue\RetryPolicy;
@@ -77,6 +78,27 @@ final class SchemaTest extends TestCase
         ], array_slice($statements, 1));
     }
 
+    public function testPostgresFoldsTheTableNameAndTruncatesIndexNamesAsUnquotedV1Sql(): void
+    {
+        $table = 'Queue_' . str_repeat('x', 40);
+        $statements = $this->captureStatementsFor(PostgreSQLPlatform::class, $table);
+
+        $folded = strtolower($table);
+        $this->assertStringContainsString("CREATE TABLE IF NOT EXISTS {$folded} (", $statements[0]);
+        $this->assertSame(
+            'CREATE INDEX ' . substr("idx_{$folded}_type_status_scheduled", 0, 63)
+            . " ON {$folded} (type, status, scheduled_at, id)",
+            $statements[2],
+        );
+    }
+
+    public function testPostgresRejectsTableNamesWhoseIndexNamesWouldCollide(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('too long');
+        $this->captureStatementsFor(PostgreSQLPlatform::class, str_repeat('j', 51));
+    }
+
     public function testUnsupportedPlatformThrows(): void
     {
         $platform = $this->createStub(AbstractPlatform::class);
@@ -117,6 +139,25 @@ final class SchemaTest extends TestCase
         Schema::install($connection);
 
         $this->assertArrayHasKey('finished_at', $connection->createSchemaManager()->listTableColumns('jobs'));
+    }
+
+    public function testInstallRequiresMigrationWhileLegacyColumnsRemain(): void
+    {
+        $connection = DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+        Schema::install($connection);
+        // What a MySQL migration interrupted after adding the v2 columns leaves behind.
+        $connection->executeStatement('ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0');
+        try {
+            Schema::install($connection);
+            $this->fail('A table with v1 columns must be migrated first');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('Schema::migrate', $error->getMessage());
+        }
+
+        Schema::migrate($connection, new RetryPolicy());
+        Schema::install($connection);
+
+        $this->assertArrayNotHasKey('retry_count', $connection->createSchemaManager()->listTableColumns('jobs'));
     }
 
     public function testMigrationPreservesLegacyJobsAndRecoversInterruptedAttempts(): void
@@ -226,7 +267,7 @@ final class SchemaTest extends TestCase
      * @param class-string<AbstractPlatform> $platformClass
      * @return list<string>
      */
-    private function captureStatementsFor(string $platformClass): array
+    private function captureStatementsFor(string $platformClass, string $table = 'jobs'): array
     {
         $platform = $this->createStub($platformClass);
         $platform->method('quoteSingleIdentifier')->willReturnCallback(static fn(string $name): string => $name);
@@ -241,7 +282,7 @@ final class SchemaTest extends TestCase
             }
         );
 
-        Schema::install($connection);
+        Schema::install($connection, $table);
         return $statements;
     }
 }

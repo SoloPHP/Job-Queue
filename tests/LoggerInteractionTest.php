@@ -83,6 +83,25 @@ final class LoggerInteractionTest extends QueueTestCase
         $this->assertInstanceOf(RuntimeException::class, $retry[0]['context']['exception'] ?? null);
     }
 
+    public function testManualRetryIsLogged(): void
+    {
+        $queue = new JobQueue(
+            storage: $this->storage,
+            codec: $this->codec(),
+            retry: new RetryPolicy(maxAttempts: 1),
+            logger: $this->logger,
+        );
+        $id = $queue->push(new FailingJob('boom'));
+        $queue->processJobs();
+
+        $this->assertTrue($queue->retry($id));
+        $this->assertFalse($queue->retry($id));
+        $this->assertSame(
+            [['level' => 'info', 'message' => 'Job re-queued', 'context' => ['id' => $id]]],
+            $this->logger->byMessage('Job re-queued'),
+        );
+    }
+
     public function testMaintenanceLogsPendingJobsThatExpired(): void
     {
         $clock = new FrozenClock();

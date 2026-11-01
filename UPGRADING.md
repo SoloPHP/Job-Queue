@@ -38,8 +38,8 @@ The migration adds `claim_token`, `lease_until`, `finished_at`, and saved retry 
 | First delay `2 * baseDelay` | First delay `baseDelay`; then doubles to `maxDelay` |
 | Retry policy on each consumer | Policy saved when each job is enqueued |
 | `JobQueue(container: $container)` | `JobQueue($storage, codec: new ContainerJobCodec($container))`; the codec and its container are required |
-| Jobs with `createFromContainer()` and `JsonSerializable` | Add `implements PersistableJobInterface` |
-| `Worker(batchSize: 10)` | Remove `batchSize`; the worker claims one job at a time |
+| Jobs with `createFromContainer()` and `JsonSerializable` | Add `implements PersistableJobInterface`; `jsonSerialize()` must return `array` |
+| `Worker(batchSize: 10)` | Remove `batchSize`; the worker claims one job at a time. `type` is now the second parameter, so pass arguments by name |
 | `JobQueue(autoReclaim: false)` | Removed; use `Worker(maintenanceInterval: null)` and call `maintain()` from cron |
 | `reclaimStuck()` | `maintain()`, which also expires overdue pending jobs; returns `requeued`, `failed`, `expired` |
 | `markCompleted($id)` / `markFailed($id, $error)` | `complete($claim)` / `fail($claim, $error)`, using the object returned by `claim()` |
@@ -61,7 +61,7 @@ The migration adds `claim_token`, `lease_until`, `finished_at`, and saved retry 
 
 ## Existing jobs and adapters
 
-The standard codec still reads `{job_class, job_data}` and tolerates an absent `job_data` for old stateless jobs. Job classes must implement `PersistableJobInterface`: v1 jobs already have `jsonSerialize()` and a public static `createFromContainer()`, so adding the interface is enough. A stored job whose class does not implement it fails to decode, so deploy the updated classes before starting v2 workers.
+The standard codec still reads `{job_class, job_data}` and tolerates an absent `job_data` for old stateless jobs. Job classes must implement `PersistableJobInterface`, which declares `jsonSerialize(): array` and `createFromContainer(ContainerInterface $container, array $data): self`. A v1 job with these exact signatures only needs the interface added. Narrow a `jsonSerialize(): mixed` return type to `array`, and give stateless jobs without `jsonSerialize()` one that returns `[]`. A stored job whose class does not implement the interface fails to decode, so deploy the updated classes before starting v2 workers.
 
 Explicit non-array job data is rejected. Legacy jobs already stored with missing data cannot have that data recovered automatically; inspect or recreate them before rollout.
 
@@ -72,7 +72,7 @@ Integrations accepting `Solo\Contracts\JobQueue\JobQueueInterface`, including ol
 - Choose `leaseDuration` to cover the longest uninterrupted handler operation. Manual/custom execution can renew the current claim cooperatively. The standard worker has no background heartbeat.
 - An attempt can still be completed or failed after its lease ended, until maintenance reclaims the job.
 - Consumer operations reject active external transactions and disabled autocommit. Producer inserts may join application transactions.
-- MySQL/MariaDB claims run at READ COMMITTED for the claim transaction only. Deadlocks, lock wait timeouts, and busy SQLite errors in consumer statements are retried.
+- MySQL/MariaDB claims run at READ COMMITTED for the claim transaction only. With binary logging enabled, `binlog_format` must be ROW or MIXED (the defaults); `STATEMENT` rejects every claim. Deadlocks, lock wait timeouts, and busy SQLite errors in consumer statements are retried.
 - Exceptions from observers, logging, or acknowledgement propagate; they do not invoke the handler failure path. Supervise the process.
 - Shutdown and limits apply between individual jobs. Existing signal handlers are restored after the worker stops.
 - `Worker` runs maintenance at start and then every 60 seconds by default (`maintenanceInterval`), not before every job.
