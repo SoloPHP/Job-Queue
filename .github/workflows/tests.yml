@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.3', '8.4']
+        php: ['8.3', '8.4', '8.5']
 
     name: PHP ${{ matrix.php }}
 
@@ -24,7 +24,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: json, pdo_sqlite
+          extensions: mbstring, pdo_sqlite, pcntl
           coverage: none
           tools: composer:v2
 
@@ -45,4 +45,87 @@ jobs:
         run: composer analyze
 
       - name: Unit tests
+        run: composer test-unit
+
+  integration:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4', '8.5']
+        database: [mysql, mariadb, postgres]
+        include:
+          - database: mysql
+            image: mysql:8.4
+            driver: pdo_mysql
+            port: '3306'
+            health: mysqladmin ping -h 127.0.0.1 -uqueue_test -pqueue_test --silent
+          - database: mariadb
+            image: mariadb:12.3
+            driver: pdo_mysql
+            port: '3306'
+            health: healthcheck.sh --connect --innodb_initialized
+          - database: postgres
+            image: postgres:17
+            driver: pdo_pgsql
+            port: '5432'
+            health: pg_isready -h 127.0.0.1 -U queue_test -d queue_test
+
+    name: PHP ${{ matrix.php }} / ${{ matrix.database }}
+
+    services:
+      database:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_ROOT_PASSWORD: root_test
+          MYSQL_DATABASE: queue_test
+          MYSQL_USER: queue_test
+          MYSQL_PASSWORD: queue_test
+          MARIADB_ROOT_PASSWORD: root_test
+          MARIADB_DATABASE: queue_test
+          MARIADB_USER: queue_test
+          MARIADB_PASSWORD: queue_test
+          POSTGRES_DB: queue_test
+          POSTGRES_USER: queue_test
+          POSTGRES_PASSWORD: queue_test
+        ports:
+          - ${{ matrix.port }}/tcp
+        options: >-
+          --health-cmd="${{ matrix.health }}"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+    env:
+      QUEUE_TEST_DRIVER: ${{ matrix.driver }}
+      QUEUE_TEST_HOST: 127.0.0.1
+      QUEUE_TEST_DB: queue_test
+      QUEUE_TEST_USER: queue_test
+      QUEUE_TEST_PASSWORD: queue_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, pdo_sqlite, pdo_mysql, pdo_pgsql, pcntl
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ matrix.php }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ matrix.php }}-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Integration tests
+        env:
+          QUEUE_TEST_PORT: ${{ job.services.database.ports[format('{0}', matrix.port)] }}
         run: composer test-unit

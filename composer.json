@@ -28,11 +28,12 @@
   },
   "require": {
     "php": ">=8.3",
-    "ext-json": "*",
+    "ext-mbstring": "*",
     "doctrine/dbal": "^4.0",
-    "solophp/contracts": "^1.4",
+    "solophp/contracts": "^1.8",
     "psr/container": "^1.0|^2.0",
-    "psr/log": "^1.0|^2.0|^3.0"
+    "psr/log": "^1.0|^2.0|^3.0",
+    "psr/clock": "^1.0"
   },
   "require-dev": {
     "phpstan/phpstan": "^2.0",
@@ -44,9 +45,12 @@
     "solophp/logger": "PSR-3 compatible logger implementation"
   },
   "scripts": {
-    "cs-check": "phpcs --standard=PSR12 src/",
-    "cs-fix": "phpcbf --standard=PSR12 src/",
-    "analyze": "phpstan analyse src --level=max",
+    "cs-check": "phpcs --standard=PSR12 src/ tests/",
+    "cs-fix": "phpcbf --standard=PSR12 src/ tests/",
+    "analyze": [
+      "phpstan analyse src --level=max",
+      "phpstan analyse tests --level=5"
+    ],
     "test-unit": "phpunit",
     "test": [
       "@cs-check",

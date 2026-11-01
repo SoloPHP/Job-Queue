@@ -5,147 +5,237 @@ declare(strict_types=1);
 namespace Solo\JobQueue;
 
 use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\DBAL\Platforms\SQLitePlatform;
 use InvalidArgumentException;
 use RuntimeException;
 
-/**
- * Creates the jobs table for the target database platform.
- *
- * Supported:
- *   - MySQL 8.0+ / MariaDB 10.6+ (FOR UPDATE SKIP LOCKED)
- *   - PostgreSQL 9.5+
- *   - SQLite 3.35+
- */
+/** Creates v2 tables and explicitly migrates stopped v1 queues. */
 final class Schema
 {
     private const TABLE_NAME_PATTERN = '/^[a-zA-Z_][a-zA-Z0-9_]*$/';
+    private const REQUIRED_COLUMNS = [
+        'attempts', 'claim_token', 'lease_until', 'max_attempts', 'base_delay', 'max_delay', 'finished_at',
+    ];
+    /** Index suffix => columns: the one definition used by install() and migrate(). */
+    private const INDEXES = [
+        'status_scheduled' => ['status', 'scheduled_at', 'id'],
+        'type_status_scheduled' => ['type', 'status', 'scheduled_at', 'id'],
+        'status_expires' => ['status', 'expires_at'],
+        'lease_until' => ['lease_until'],
+    ];
 
-    /**
-     * Single source of truth for table-name validation. Table names are
-     * interpolated into raw SQL by both this class and `DbalJobStorage`, so
-     * any caller that accepts a user-controllable table name MUST validate
-     * it through here to prevent SQL injection.
-     *
-     * @throws InvalidArgumentException When $table does not match the safe pattern.
-     */
+    /** @internal */
     public static function assertValidTableName(string $table): void
     {
         if (preg_match(self::TABLE_NAME_PATTERN, $table) !== 1) {
-            throw new InvalidArgumentException(sprintf(
-                'Invalid table name "%s". Must match %s.',
-                $table,
-                self::TABLE_NAME_PATTERN,
+            throw new InvalidArgumentException(sprintf('Invalid table name "%s".', $table));
+        }
+    }
+
+    /** @internal */
+    public static function assertSupportedPlatform(Connection $connection): void
+    {
+        $platform = $connection->getDatabasePlatform();
+        if (
+            !$platform instanceof SQLitePlatform
+            && !$platform instanceof PostgreSQLPlatform
+            && !$platform instanceof AbstractMySQLPlatform
+        ) {
+            throw new RuntimeException(sprintf(
+                'Unsupported database platform: %s. Supported: MySQL 8+, MariaDB 10.6+, PostgreSQL, SQLite 3.35+.',
+                $platform::class,
             ));
         }
     }
 
-    /**
-     * @throws \Doctrine\DBAL\Exception
-     * @throws InvalidArgumentException
-     */
     public static function install(Connection $connection, string $table = 'jobs'): void
     {
         self::assertValidTableName($table);
-
+        self::assertSupportedPlatform($connection);
+        $manager = $connection->createSchemaManager();
+        if ($manager->tablesExist([$table])) {
+            $columns = $manager->listTableColumns($table);
+            foreach (self::REQUIRED_COLUMNS as $column) {
+                if (!isset($columns[$column])) {
+                    throw new RuntimeException(
+                        'Outdated queue schema detected. Stop workers and run Schema::migrate().',
+                    );
+                }
+            }
+        }
         $platform = $connection->getDatabasePlatform();
-
-        if ($platform instanceof SQLitePlatform) {
-            self::installSqlite($connection, $table);
-            return;
-        }
-
-        if ($platform instanceof PostgreSQLPlatform) {
-            self::installPostgres($connection, $table);
-            return;
-        }
-
-        if ($platform instanceof AbstractMySQLPlatform) {
-            self::installMysql($connection, $table);
-            return;
-        }
-
-        throw new RuntimeException(sprintf(
-            'Unsupported database platform: %s. Supported: MySQL 8+, MariaDB 10.6+, PostgreSQL 9.5+, SQLite 3.35+.',
-            $platform::class
-        ));
-    }
-
-    private static function installSqlite(Connection $connection, string $table): void
-    {
+        $id = match (true) {
+            $platform instanceof SQLitePlatform => 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            $platform instanceof PostgreSQLPlatform => 'BIGSERIAL PRIMARY KEY',
+            default => 'BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY',
+        };
+        $payload = match (true) {
+            $platform instanceof SQLitePlatform => 'TEXT',
+            $platform instanceof PostgreSQLPlatform => 'JSONB',
+            default => 'JSON',
+        };
+        $timestamp = $platform instanceof PostgreSQLPlatform ? 'TIMESTAMP' : 'DATETIME';
+        $createdDefault = $platform instanceof PostgreSQLPlatform
+            ? "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')" : 'CURRENT_TIMESTAMP';
+        $suffix = $platform instanceof AbstractMySQLPlatform
+            ? ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci' : '';
         $connection->executeStatement(
-            "CREATE TABLE IF NOT EXISTS {$table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            'CREATE TABLE IF NOT EXISTS ' . self::quote($connection, $table) . " (
+                id {$id},
                 name VARCHAR(255) NOT NULL,
                 type VARCHAR(64) NOT NULL DEFAULT 'default',
-                payload TEXT NOT NULL,
+                payload {$payload} NOT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                retry_count INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claim_token VARCHAR(64) NULL,
+                lease_until {$timestamp} NULL,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                base_delay INTEGER NOT NULL DEFAULT 60,
+                max_delay INTEGER NOT NULL DEFAULT 3600,
                 error TEXT NULL,
-                scheduled_at DATETIME NOT NULL,
-                locked_at DATETIME NULL,
-                expires_at DATETIME NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"
+                scheduled_at {$timestamp} NOT NULL,
+                expires_at {$timestamp} NULL,
+                finished_at {$timestamp} NULL,
+                created_at {$timestamp} NOT NULL DEFAULT {$createdDefault}
+            ){$suffix}",
         );
         self::installIndexes($connection, $table);
     }
 
-    private static function installMysql(Connection $connection, string $table): void
+    /**
+     * Stop all producers and consumers before migrating. The supplied policy is
+     * persisted for every legacy job. An interrupted v1 attempt counts as used;
+     * it is requeued immediately, failed if exhausted, or expired if overdue.
+     * v1 kept no finish time: legacy completed/failed jobs get their last scheduled time.
+     *
+     * SQLite/PostgreSQL migrations are transactional. MySQL DDL commits implicitly:
+     * take a backup first; an interrupted migration can be rerun with the same
+     * policy while all producers/consumers remain stopped. Legacy columns are
+     * removed only after their data has been converted.
+     */
+    public static function migrate(Connection $connection, RetryPolicy $legacyPolicy, string $table = 'jobs'): void
     {
-        $connection->executeStatement(
-            "CREATE TABLE IF NOT EXISTS {$table} (
-                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                type VARCHAR(64) NOT NULL DEFAULT 'default',
-                payload JSON NOT NULL,
-                status ENUM('pending', 'in_progress', 'completed', 'failed') NOT NULL DEFAULT 'pending',
-                retry_count INT UNSIGNED NOT NULL DEFAULT 0,
-                error TEXT NULL,
-                scheduled_at DATETIME NOT NULL,
-                locked_at DATETIME NULL,
-                expires_at DATETIME NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_status_scheduled (status, scheduled_at),
-                INDEX idx_type_status_scheduled (type, status, scheduled_at),
-                INDEX idx_locked_at (locked_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
-        );
+        self::assertValidTableName($table);
+        self::assertSupportedPlatform($connection);
+        if ($connection->isTransactionActive() || !$connection->isAutoCommit()) {
+            throw new RuntimeException('Queue schema migration requires autocommit without an active transaction.');
+        }
+        if (!$connection->createSchemaManager()->tablesExist([$table])) {
+            self::install($connection, $table);
+            return;
+        }
+        $mysql = $connection->getDatabasePlatform() instanceof AbstractMySQLPlatform;
+        $migration = static function () use ($connection, $legacyPolicy, $table, $mysql): void {
+            $quotedTable = self::quote($connection, $table);
+            $columns = $connection->createSchemaManager()->listTableColumns($table);
+            $timestamp = $connection->getDatabasePlatform() instanceof PostgreSQLPlatform ? 'TIMESTAMP' : 'DATETIME';
+            $definitions = [
+                'attempts' => 'INTEGER NOT NULL DEFAULT 0',
+                'claim_token' => 'VARCHAR(64) NULL',
+                'lease_until' => "{$timestamp} NULL",
+                'max_attempts' => 'INTEGER NOT NULL DEFAULT ' . $legacyPolicy->maxAttempts,
+                'base_delay' => 'INTEGER NOT NULL DEFAULT ' . $legacyPolicy->baseDelay,
+                'max_delay' => 'INTEGER NOT NULL DEFAULT ' . $legacyPolicy->maxDelay,
+                'finished_at' => "{$timestamp} NULL",
+            ];
+            foreach ($definitions as $name => $definition) {
+                if (!isset($columns[$name])) {
+                    $connection->executeStatement("ALTER TABLE {$quotedTable} ADD COLUMN {$name} {$definition}");
+                }
+            }
+            if (isset($columns['retry_count'])) {
+                if ($mysql) {
+                    // Convert the legacy TIMESTAMP to a UTC DATETIME while preserving its instant.
+                    // New rows then have the same timezone-independent representation as fresh tables.
+                    $timezone = $connection->fetchOne('SELECT @@session.time_zone');
+                    if (!is_string($timezone)) {
+                        throw new RuntimeException('Cannot read the MySQL session timezone for migration.');
+                    }
+                    $connection->executeStatement("SET time_zone = '+00:00'");
+                    try {
+                        $connection->executeStatement(
+                            "ALTER TABLE {$quotedTable} MODIFY status VARCHAR(20) NOT NULL DEFAULT 'pending', "
+                            . 'MODIFY created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP',
+                        );
+                    } finally {
+                        $connection->executeStatement('SET time_zone = ?', [$timezone]);
+                    }
+                }
+                $usedAttempts = "CASE WHEN attempts > 0 THEN attempts ELSE retry_count + "
+                    . "CASE WHEN status IN ('in_progress', 'completed') THEN 1 ELSE 0 END END";
+                $overdue = "status IN ('pending', 'in_progress') AND expires_at <= ?";
+                $exhausted = "status IN ('pending', 'in_progress') AND ({$usedAttempts}) >= ?";
+                $now = gmdate('Y-m-d H:i:s');
+                // MySQL evaluates assignments left to right, so status must be assigned last.
+                $connection->executeStatement(
+                    "UPDATE {$quotedTable} SET attempts = {$usedAttempts}, max_attempts = ?, base_delay = ?, "
+                    . 'max_delay = ?, claim_token = NULL, lease_until = NULL, '
+                    . "error = CASE WHEN status = 'in_progress' "
+                    . "THEN 'Interrupted by queue schema migration' ELSE error END, "
+                    . "scheduled_at = CASE WHEN status = 'in_progress' THEN ? ELSE scheduled_at END, "
+                    . "finished_at = COALESCE(finished_at, CASE WHEN {$overdue} OR {$exhausted} THEN ? "
+                    . "WHEN status IN ('completed', 'failed') THEN scheduled_at END), "
+                    . "status = CASE WHEN {$overdue} THEN 'expired' WHEN {$exhausted} THEN 'failed' "
+                    . "WHEN status = 'in_progress' THEN 'pending' ELSE status END",
+                    [$legacyPolicy->maxAttempts, $legacyPolicy->baseDelay, $legacyPolicy->maxDelay,
+                        $now, $now, $legacyPolicy->maxAttempts, $now, $now, $legacyPolicy->maxAttempts],
+                    [ParameterType::INTEGER, ParameterType::INTEGER, ParameterType::INTEGER,
+                        ParameterType::STRING, ParameterType::STRING, ParameterType::INTEGER,
+                        ParameterType::STRING, ParameterType::STRING, ParameterType::INTEGER],
+                );
+            }
+            // Drop indexes referencing the legacy lock column before dropping that column.
+            foreach ($connection->createSchemaManager()->listTableIndexes($table) as $index) {
+                if (in_array('locked_at', $index->getColumns(), true)) {
+                    $connection->executeStatement(
+                        'DROP INDEX ' . self::quote($connection, $index->getName())
+                        . ($mysql ? " ON {$quotedTable}" : ''),
+                    );
+                }
+            }
+            foreach (['retry_count', 'locked_at'] as $legacyColumn) {
+                if (isset($columns[$legacyColumn])) {
+                    $connection->executeStatement("ALTER TABLE {$quotedTable} DROP COLUMN {$legacyColumn}");
+                }
+            }
+            self::installIndexes($connection, $table);
+        };
+        if ($mysql) {
+            $migration();
+        } else {
+            $connection->transactional($migration);
+        }
     }
 
-    private static function installPostgres(Connection $connection, string $table): void
-    {
-        $connection->executeStatement(
-            "CREATE TABLE IF NOT EXISTS {$table} (
-                id BIGSERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                type VARCHAR(64) NOT NULL DEFAULT 'default',
-                payload JSONB NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                error TEXT NULL,
-                scheduled_at TIMESTAMP NOT NULL,
-                locked_at TIMESTAMP NULL,
-                expires_at TIMESTAMP NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        self::installIndexes($connection, $table);
-    }
-
+    /** Create missing indexes and rebuild those whose columns differ from the definition. */
     private static function installIndexes(Connection $connection, string $table): void
     {
-        $connection->executeStatement(
-            "CREATE INDEX IF NOT EXISTS idx_{$table}_status_scheduled ON {$table} (status, scheduled_at)"
-        );
-        $connection->executeStatement(
-            "CREATE INDEX IF NOT EXISTS idx_{$table}_type_status_scheduled "
-            . "ON {$table} (type, status, scheduled_at)"
-        );
-        $connection->executeStatement(
-            "CREATE INDEX IF NOT EXISTS idx_{$table}_locked_at ON {$table} (locked_at)"
-        );
+        $mysql = $connection->getDatabasePlatform() instanceof AbstractMySQLPlatform;
+        $existing = $connection->createSchemaManager()->listTableIndexes($table);
+        $quotedTable = self::quote($connection, $table);
+        foreach (self::INDEXES as $suffix => $columns) {
+            // MySQL index names are per table; elsewhere they share one namespace per schema.
+            $name = $mysql ? 'idx_' . $suffix : 'idx_' . $table . '_' . $suffix;
+            $index = $existing[strtolower($name)] ?? null;
+            if ($index !== null && $index->getColumns() === $columns) {
+                continue;
+            }
+            $quotedIndex = self::quote($connection, $name);
+            if ($index !== null) {
+                // v1 created indexes under these names without the id tiebreaker.
+                $connection->executeStatement("DROP INDEX {$quotedIndex}" . ($mysql ? " ON {$quotedTable}" : ''));
+            }
+            $connection->executeStatement(
+                "CREATE INDEX {$quotedIndex} ON {$quotedTable} (" . implode(', ', $columns) . ')',
+            );
+        }
+    }
+
+    private static function quote(Connection $connection, string $identifier): string
+    {
+        return $connection->getDatabasePlatform()->quoteSingleIdentifier($identifier);
     }
 }

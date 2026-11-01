@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 namespace Solo\JobQueue\Tests\Fixtures;
 
-use JsonSerializable;
 use Psr\Container\ContainerInterface;
 use RuntimeException;
-use Solo\Contracts\JobQueue\JobInterface;
+use Solo\JobQueue\PersistableJobInterface;
 
-final class FailingJob implements JobInterface, JsonSerializable
+final class FailingJob implements PersistableJobInterface
 {
     public function __construct(private readonly string $message)
     {

@@ -5,422 +5,346 @@ declare(strict_types=1);
 namespace Solo\JobQueue;
 
 use DateTimeImmutable;
-use DateTimeZone;
-use JsonSerializable;
-use Psr\Container\ContainerInterface;
+use DateTimeInterface;
+use InvalidArgumentException;
+use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
-use RuntimeException;
 use Solo\Contracts\JobQueue\JobInterface;
-use Solo\Contracts\JobQueue\JobQueueInterface;
 use Solo\Contracts\JobQueue\JobQueueListener;
 use Solo\JobQueue\Storage\JobStorageInterface;
 use Throwable;
 
 /**
- * Job queue with atomic claim, visibility timeout and exponential backoff.
- *
- * Pure orchestration: job instantiation, listener plumbing, retry policy.
- * Persistence is delegated to an injected {@see JobStorageInterface}
- * implementation — typically {@see \Solo\JobQueue\Storage\DbalJobStorage} for
- * RDBMS backends.
- *
- * All timestamps are stored in UTC regardless of the PHP default timezone —
- * use UTC for comparisons on the storage side too.
+ * Database queue facade. A claim represents one attempt with exclusive, expiring ownership.
+ * Every next state is decided here; the storage applies it as a token-guarded update.
  */
-final readonly class JobQueue implements JobQueueInterface
+final readonly class JobQueue implements JobProducerInterface, JobProcessorInterface
 {
-    private const DATE_FORMAT = 'Y-m-d H:i:s';
     private const DEFAULT_TYPE = 'default';
-    private const RECLAIM_ERROR = 'Worker died (lock timeout)';
     private const PUSH_MANY_CHUNK = 1000;
+    private const RECLAIM_BATCH = 100;
+    private const MAX_ERROR_BYTES = 16384;
+    private const LEASE_EXPIRED = 'Worker lease expired';
+    private const DEADLINE_PASSED = 'Job execution deadline passed';
+    private const FINISHED = [JobStatus::Completed, JobStatus::Failed, JobStatus::Expired];
 
-    private DateTimeZone $utc;
     private RetryPolicy $retry;
+    private ClockInterface $clock;
 
     public function __construct(
         private JobStorageInterface $storage,
+        private JobCodecInterface $codec,
         ?RetryPolicy $retry = null,
+        private int $leaseDuration = 600,
         private bool $deleteOnSuccess = false,
-        private ?ContainerInterface $container = null,
         private ?LoggerInterface $logger = null,
         private ?JobQueueListener $listener = null,
-        private bool $autoReclaim = true,
+        ?ClockInterface $clock = null,
     ) {
-        $this->utc = new DateTimeZone('UTC');
+        if ($leaseDuration < 1) {
+            throw new InvalidArgumentException('leaseDuration must be positive.');
+        }
         $this->retry = $retry ?? new RetryPolicy();
+        $this->clock = $clock ?? new SystemClock();
     }
 
-    /**
-     * Push a typed job instance to the queue.
-     *
-     * @throws \JsonException
-     */
     public function push(
         JobInterface $job,
         ?string $type = null,
         ?DateTimeImmutable $scheduledAt = null,
-        ?DateTimeImmutable $expiresAt = null
+        ?DateTimeImmutable $expiresAt = null,
     ): int {
-        return $this->addJob($this->buildPayload($job), $scheduledAt, $expiresAt, $type);
+        $now = $this->clock->now();
+        $type ??= self::DEFAULT_TYPE;
+        $id = $this->storage->insert(
+            $job::class,
+            $type,
+            $this->encode($job),
+            $scheduledAt ?? $now,
+            $expiresAt,
+            $this->retry,
+            $now,
+        );
+        $this->log('info', 'Job queued', ['id' => $id, 'name' => $job::class, 'type' => $type]);
+        return $id;
     }
 
     /**
-     * Bulk-insert multiple jobs in a single statement. All jobs share the same
-     * type / scheduled_at / expires_at. Returns the number of rows inserted.
-     *
-     * Internally chunks into batches of {@see self::PUSH_MANY_CHUNK} to stay
-     * under PostgreSQL's 65535 bound-parameter limit and MySQL's
-     * max_allowed_packet — callers can pass any size safely.
+     * Bulk enqueue; each chunk is atomic. Earlier chunks remain committed if a later chunk fails.
      *
      * @param list<JobInterface> $jobs
-     * @throws \JsonException
      */
     public function pushMany(
         array $jobs,
         ?string $type = null,
         ?DateTimeImmutable $scheduledAt = null,
-        ?DateTimeImmutable $expiresAt = null
+        ?DateTimeImmutable $expiresAt = null,
     ): int {
-        if ($jobs === []) {
-            return 0;
-        }
-
-        $typeValue = $type ?? self::DEFAULT_TYPE;
-        $scheduledAtUtc = $this->formatUtc($scheduledAt ?? new DateTimeImmutable('now', $this->utc));
-        $expiresAtUtc = $expiresAt === null ? null : $this->formatUtc($expiresAt);
-
+        $now = $this->clock->now();
+        $type ??= self::DEFAULT_TYPE;
         $total = 0;
         foreach (array_chunk($jobs, self::PUSH_MANY_CHUNK) as $chunk) {
-            $rows = [];
-            foreach ($chunk as $job) {
-                $rows[] = [
-                    $job::class,
-                    json_encode($this->buildPayload($job), JSON_THROW_ON_ERROR),
-                ];
-            }
-            $total += $this->storage->insertMany($rows, $typeValue, $scheduledAtUtc, $expiresAtUtc);
+            $rows = array_map(fn(JobInterface $job): array => [$job::class, $this->encode($job)], $chunk);
+            $total += $this->storage->insertMany($rows, $type, $scheduledAt ?? $now, $expiresAt, $this->retry, $now);
         }
-
-        $this->log('info', 'Jobs queued', ['count' => $total, 'type' => $typeValue]);
-
+        if ($total > 0) {
+            $this->log('info', 'Jobs queued', ['count' => $total, 'type' => $type]);
+        }
         return $total;
     }
 
     /**
-     * Add a raw-payload job to the queue. The payload MUST contain a 'job_class' key.
-     *
-     * @param array<string, mixed> $payload
-     * @throws \JsonException
+     * Run maintenance once, then execute up to limit jobs, claiming each immediately before it runs.
+     * Observer and persistence exceptions propagate without becoming handler failures.
      */
-    public function addJob(
-        array $payload,
-        ?DateTimeImmutable $scheduledAt = null,
-        ?DateTimeImmutable $expiresAt = null,
-        ?string $type = null
-    ): int {
-        $name = isset($payload['job_class']) && is_string($payload['job_class'])
-            ? $payload['job_class']
-            : 'unknown_job';
-
-        $typeValue = $type ?? self::DEFAULT_TYPE;
-        $scheduledAt ??= new DateTimeImmutable('now', $this->utc);
-
-        $id = $this->storage->insert(
-            $name,
-            $typeValue,
-            json_encode($payload, JSON_THROW_ON_ERROR),
-            $this->formatUtc($scheduledAt),
-            $expiresAt === null ? null : $this->formatUtc($expiresAt),
-        );
-
-        $this->log('info', 'Job queued', ['id' => $id, 'name' => $name, 'type' => $typeValue]);
-
-        return $id;
-    }
-
-    /**
-     * Return pending jobs ready for execution. Informational read — does not lock rows.
-     *
-     * @return array<int, array<string, mixed>>
-     */
-    public function getPendingJobs(int $limit = 10, ?string $onlyType = null): array
+    public function processJobs(int $limit = 10, ?string $type = null): int
     {
-        return $this->storage->fetchPending($limit, $onlyType, $this->now());
-    }
-
-    /**
-     * Claim pending jobs and run them. Stuck jobs are reclaimed before each
-     * batch unless `autoReclaim = false` (then call `reclaimStuck()` yourself
-     * from a separate cron).
-     *
-     * @return int Number of jobs actually claimed and executed in this call
-     */
-    public function processJobs(int $limit = 10, ?string $onlyType = null): int
-    {
-        if ($this->autoReclaim) {
-            $this->reclaimStuck();
+        if ($limit < 0) {
+            throw new InvalidArgumentException('limit must be non-negative.');
         }
-
-        $claimed = $this->storage->claim($limit, $onlyType, $this->now());
-
-        if ($claimed === []) {
+        if ($limit === 0) {
             return 0;
         }
-
-        $this->log('info', 'Processing claimed jobs', ['count' => count($claimed)]);
-
-        foreach ($claimed as $job) {
-            $this->run($job);
+        $this->maintain();
+        $processed = 0;
+        while ($processed < $limit && $this->processNext($type)) {
+            ++$processed;
         }
+        return $processed;
+    }
 
-        return count($claimed);
+    public function processNext(?string $type = null): bool
+    {
+        $job = $this->claim($type);
+        if ($job === null) {
+            return false;
+        }
+        $this->run($job);
+        return true;
     }
 
     /**
-     * Return counts grouped by status. All four status keys are always present
-     * (missing statuses default to 0). Filter by type when monitoring a specific
-     * workload — e.g. progress of a 'storefront-resync' batch.
-     *
-     * Without `$type` the query is a full-table scan. Pass `$type` for batch
-     * progress, or rely on `deleteOnSuccess` to keep the table small.
-     *
-     * @return array{pending: int, in_progress: int, completed: int, failed: int}
+     * Recover up to 100 attempts whose lease expired, using each job's saved policy, and move
+     * pending jobs past their deadline to expired. Safe to run from several workers at once.
      */
+    public function maintain(): array
+    {
+        $now = $this->clock->now();
+        $reclaimed = ['requeued' => 0, 'failed' => 0, 'expired' => 0];
+        foreach ($this->storage->expiredLeases($now, self::RECLAIM_BATCH) as $job) {
+            [$status, $runAt] = $this->outcome($job, $now);
+            if ($this->storage->reclaim($job, $status, self::LEASE_EXPIRED, $now, $runAt)) {
+                ++$reclaimed[match ($status) {
+                    JobStatus::Pending => 'requeued',
+                    JobStatus::Failed => 'failed',
+                    default => 'expired',
+                }];
+            }
+        }
+        if (array_sum($reclaimed) > 0) {
+            $this->log('warning', 'Reclaimed stuck jobs', $reclaimed);
+            $this->listener?->onReclaimed($reclaimed['requeued'], $reclaimed['failed'] + $reclaimed['expired']);
+        }
+
+        $expired = $this->storage->expirePending($now, self::DEADLINE_PASSED);
+        if ($expired > 0) {
+            $this->log('warning', 'Pending jobs expired', ['count' => $expired]);
+        }
+
+        return [
+            'requeued' => $reclaimed['requeued'],
+            'failed' => $reclaimed['failed'],
+            'expired' => $reclaimed['expired'] + $expired,
+        ];
+    }
+
+    /** Claim one job for manual execution. Complete, fail and renew require this claim's token. */
+    public function claim(?string $type = null): ?ClaimedJob
+    {
+        $now = $this->clock->now();
+        return $this->storage->claim($type, $now, $this->leaseDeadline($now));
+    }
+
+    /**
+     * Accepted while this attempt still owns the job, even after its lease ended, until maintenance
+     * reclaims it. False means the job was reclaimed; no completion event is emitted.
+     */
+    public function complete(ClaimedJob $job): bool
+    {
+        if (!$this->storage->complete($job, $this->clock->now(), $this->deleteOnSuccess)) {
+            $this->log('warning', 'Job ownership lost before completion', ['id' => $job->id]);
+            return false;
+        }
+        $this->log('info', 'Job completed', ['id' => $job->id]);
+        $this->listener?->onCompleted($job->id);
+        return true;
+    }
+
+    /** Same ownership rule as complete(). The retry follows the job's saved policy and deadline. */
+    public function fail(ClaimedJob $job, Throwable|string $error): bool
+    {
+        $now = $this->clock->now();
+        [$status, $runAt] = $this->outcome($job, $now);
+        if (!$this->storage->fail($job, $status, $this->formatError($error), $now, $runAt)) {
+            $this->log('warning', 'Job ownership lost before failure', ['id' => $job->id]);
+            return false;
+        }
+        $permanent = $status !== JobStatus::Pending;
+        $context = [
+            'id' => $job->id,
+            'attempt' => $job->attempt,
+            'next_run' => $runAt?->format(DateTimeInterface::ATOM),
+        ];
+        $context += $error instanceof Throwable ? ['exception' => $error] : ['error' => $error];
+        $this->log($permanent ? 'error' : 'warning', match ($status) {
+            JobStatus::Expired => 'Job expired after failure',
+            JobStatus::Failed => 'Job permanently failed',
+            default => 'Job failed, will retry',
+        }, $context);
+        $this->listener?->onFailed($job->id, $error, $permanent);
+        return true;
+    }
+
+    /**
+     * Cooperative lease extension. Returns the claim with its extended lease, or null once the
+     * lease has ended or another attempt owns the job: stop working on it then.
+     */
+    public function renew(ClaimedJob $job): ?ClaimedJob
+    {
+        $now = $this->clock->now();
+        $leaseUntil = $this->leaseDeadline($now);
+        if (!$this->storage->renew($job, $now, $leaseUntil)) {
+            return null;
+        }
+        return $leaseUntil > $job->leaseUntil ? $job->withLeaseUntil($leaseUntil) : $job;
+    }
+
+    /** An expired job requires a new future deadline; attempts restart on an accepted retry. */
+    public function retry(int $jobId, ?DateTimeImmutable $expiresAt = null): bool
+    {
+        $now = $this->clock->now();
+        if ($expiresAt !== null && $expiresAt <= $now) {
+            return false;
+        }
+        return $this->storage->retry($jobId, $now, $expiresAt);
+    }
+
+    /** @return list<JobRecord> Ready jobs in claim order; an informational read that claims nothing. */
+    public function getPendingJobs(int $limit = 10, ?string $type = null): array
+    {
+        return $this->storage->pending($limit, $type, $this->clock->now());
+    }
+
+    /** @return list<JobRecord> Permanently failed jobs, newest first. */
+    public function getFailedJobs(int $limit = 50, ?string $type = null): array
+    {
+        return $this->storage->failed($limit, $type);
+    }
+
+    /** @return array{pending: int, in_progress: int, completed: int, failed: int, expired: int} */
     public function getStats(?string $type = null): array
     {
         return $this->storage->countByStatus($type);
     }
 
     /**
-     * Retrieve permanently-failed jobs for inspection. Most recent first.
+     * Delete finished jobs whose finish time is before the cutoff, in bounded batches.
      *
-     * @return array<int, array<string, mixed>>
+     * @param list<JobStatus> $statuses Any of completed, failed and expired.
+     * @return int Number of deleted jobs
      */
-    public function getFailedJobs(int $limit = 50, ?string $type = null): array
+    public function prune(DateTimeImmutable $finishedBefore, array $statuses = [JobStatus::Completed]): int
     {
-        return $this->storage->fetchFailed($limit, $type);
+        if ($statuses === []) {
+            throw new InvalidArgumentException('At least one status is required.');
+        }
+        foreach ($statuses as $status) {
+            if (!in_array($status, self::FINISHED, true)) {
+                throw new InvalidArgumentException("Only finished jobs can be pruned, not {$status->value}.");
+            }
+        }
+        $deleted = $this->storage->prune($finishedBefore, $statuses);
+        if ($deleted > 0) {
+            $this->log('info', 'Pruned finished jobs', ['count' => $deleted]);
+        }
+        return $deleted;
     }
 
-    /**
-     * Re-queue a failed job: status → pending, retry_count reset to 0,
-     * scheduled_at set to now, error cleared. Returns true if a row was
-     * updated, false if no such job existed.
-     *
-     */
-    public function retry(int $jobId): bool
+    private function run(ClaimedJob $job): void
     {
-        $updated = $this->storage->updateToPending($jobId, 0, null, $this->now(), requireFailedStatus: true) > 0;
-        if ($updated) {
-            $this->log('info', 'Job re-queued', ['id' => $jobId]);
-        }
-        return $updated;
-    }
-
-    /**
-     * Mark a job as completed (or delete it when deleteOnSuccess is enabled).
-     *
-     */
-    public function markCompleted(int $jobId): void
-    {
-        if ($this->deleteOnSuccess) {
-            $this->storage->delete($jobId);
-        } else {
-            $this->storage->markCompleted($jobId);
-        }
-
-        $this->log('info', 'Job completed', ['id' => $jobId]);
-        $this->listener?->onCompleted($jobId);
-    }
-
-    /**
-     * Mark a job as failed. Retries are rescheduled with exponential backoff;
-     * after maxRetries is reached the job is permanently marked as 'failed'.
-     *
-     * Accepts a Throwable (recommended — full class/file/line captured in the
-     * DB error column and forwarded to the logger under PSR-3 'exception' key)
-     * or a plain string for manual failures.
-     *
-     */
-    public function markFailed(int $jobId, Throwable|string $error = ''): void
-    {
-        $current = $this->storage->getRetryCount($jobId);
-        if ($current === null) {
-            return;
-        }
-
-        $errorText = $this->formatError($error);
-        $logContext = $error instanceof Throwable
-            ? ['exception' => $error]
-            : ['error' => $errorText];
-
-        $nextRetry = $current + 1;
-
-        if ($nextRetry >= $this->retry->maxRetries) {
-            $this->storage->updateToFailed($jobId, $nextRetry, $errorText);
-            $this->log('error', 'Job permanently failed', ['id' => $jobId] + $logContext);
-            $this->listener?->onFailed($jobId, $error, true);
-            return;
-        }
-
-        $nextRun = $this->backoffAt($nextRetry);
-
-        $this->storage->updateToPending($jobId, $nextRetry, $errorText, $nextRun);
-
-        $this->log('warning', 'Job failed, will retry', [
-            'id'       => $jobId,
-            'retry'    => $nextRetry,
-            'next_run' => $nextRun,
-        ] + $logContext);
-        $this->listener?->onFailed($jobId, $error, false);
-    }
-
-    /**
-     * Return jobs whose worker died (locked_at older than lockTimeout) back to
-     * pending, or mark them failed if retries are exhausted. Safe to call
-     * standalone from a dedicated cron (e.g. once a minute) while another
-     * process runs `processJobs()` with `autoReclaim = false`.
-     *
-     * @return array{requeued: int, failed: int}
-     */
-    public function reclaimStuck(): array
-    {
-        $staleBefore = $this->formatUtc(
-            (new DateTimeImmutable('now', $this->utc))->modify("-{$this->retry->lockTimeout} seconds")
-        );
-
-        $result = $this->storage->reclaimStuck($this->retry->maxRetries, $staleBefore, self::RECLAIM_ERROR);
-
-        if ($result['failed'] + $result['requeued'] > 0) {
-            $this->log('warning', 'Reclaimed stuck jobs', $result);
-            $this->listener?->onReclaimed($result['requeued'], $result['failed']);
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param array{id: int, name: string, payload: string} $job
-     *
-     */
-    private function run(array $job): void
-    {
-        $id = $job['id'];
-
         try {
-            $instance = $this->instantiate($job['payload']);
+            $instance = $this->codec->decode($job->payload);
         } catch (Throwable $e) {
-            $this->markFailed($id, $e);
+            $this->fail($job, $e);
             return;
         }
-
-        $this->log('info', 'Running job', ['id' => $id, 'class' => $instance::class]);
-        // Listener exceptions propagate by contract — keep this call outside the
-        // handle()/markCompleted() try so a buggy listener doesn't fail the job.
-        $this->listener?->onClaimed($id, $instance::class);
-
+        $this->log('info', 'Running job', ['id' => $job->id, 'class' => $instance::class]);
+        $this->listener?->onClaimed($job->id, $instance::class);
+        // Starting after the lease ended would race with maintenance handing the job to another worker.
+        if ($this->clock->now() >= $job->leaseUntil) {
+            $this->fail($job, 'Lease expired before execution started');
+            return;
+        }
         try {
             $instance->handle();
-            $this->markCompleted($id);
         } catch (Throwable $e) {
-            $this->markFailed($id, $e);
+            $this->fail($job, $e);
+            return;
         }
+        $this->complete($job);
     }
 
     /**
-     * Decode payload and instantiate a JobInterface via createFromContainer().
+     * Where a failed or abandoned attempt goes next: the single decision used by fail() and maintain().
+     *
+     * @return array{JobStatus, ?DateTimeImmutable}
      */
-    private function instantiate(string $payloadJson): JobInterface
+    private function outcome(ClaimedJob $job, DateTimeImmutable $now): array
     {
-        /** @var mixed $payload */
-        $payload = json_decode($payloadJson, true, 512, JSON_THROW_ON_ERROR);
-
-        if (!is_array($payload) || !isset($payload['job_class']) || !is_string($payload['job_class'])) {
-            throw new RuntimeException('Invalid job payload: missing job_class');
+        if ($job->expiresAt !== null && $job->expiresAt <= $now) {
+            return [JobStatus::Expired, null];
         }
-
-        $jobClass = $payload['job_class'];
-        $jobData  = isset($payload['job_data']) && is_array($payload['job_data'])
-            ? $payload['job_data']
-            : [];
-
-        if (!class_exists($jobClass)) {
-            throw new RuntimeException("Job class does not exist: {$jobClass}");
+        if ($job->attempt >= $job->retryPolicy->maxAttempts) {
+            return [JobStatus::Failed, null];
         }
-
-        if (!is_subclass_of($jobClass, JobInterface::class)) {
-            throw new RuntimeException("Class {$jobClass} does not implement " . JobInterface::class);
+        $runAt = $now->modify('+' . $job->retryPolicy->backoffSeconds($job->attempt) . ' seconds');
+        // A retry due at or after the deadline could never run.
+        if ($job->expiresAt !== null && $runAt >= $job->expiresAt) {
+            return [JobStatus::Expired, null];
         }
-
-        if (!method_exists($jobClass, 'createFromContainer')) {
-            throw new RuntimeException(
-                "Class {$jobClass} must define a static method "
-                . "createFromContainer(ContainerInterface \$c, array \$data): self"
-            );
-        }
-
-        if ($this->container === null) {
-            throw new RuntimeException(
-                "JobQueue requires a PSR-11 container to instantiate {$jobClass}"
-            );
-        }
-
-        /** @var JobInterface $instance */
-        $instance = $jobClass::createFromContainer($this->container, $jobData);
-
-        return $instance;
+        return [JobStatus::Pending, $runAt];
     }
 
-    private function backoffAt(int $retry): string
+    /** Whole seconds, matching the stored precision. */
+    private function leaseDeadline(DateTimeImmutable $now): DateTimeImmutable
     {
-        $delay = $this->retry->backoffSeconds($retry);
-        return $this->formatUtc((new DateTimeImmutable('now', $this->utc))->modify("+{$delay} seconds"));
+        return new DateTimeImmutable('@' . ($now->getTimestamp() + $this->leaseDuration));
     }
 
-    private function now(): string
+    private function encode(JobInterface $job): string
     {
-        return $this->formatUtc(new DateTimeImmutable('now', $this->utc));
+        $payload = $this->codec->encode($job);
+        if (!json_validate($payload)) {
+            throw new InvalidArgumentException('JobCodecInterface::encode() must return valid JSON.');
+        }
+        return $payload;
     }
 
-    private function formatUtc(DateTimeImmutable $dt): string
-    {
-        return $dt->setTimezone($this->utc)->format(self::DATE_FORMAT);
-    }
-
-    /**
-     * @return array{job_class: class-string<JobInterface>, job_data: mixed}
-     */
-    private function buildPayload(JobInterface $job): array
-    {
-        return [
-            'job_class' => $job::class,
-            'job_data'  => $job instanceof JsonSerializable ? $job->jsonSerialize() : [],
-        ];
-    }
-
-    /**
-     * @param array<string, mixed> $context
-     */
+    /** @param array<string, mixed> $context */
     private function log(string $level, string $message, array $context = []): void
     {
         $this->logger?->log($level, $message, $context);
     }
 
-    /**
-     * Render a Throwable as "Class: message @ file:line" — enough for triage
-     * without requiring a structured error column.
-     */
+    /** Valid UTF-8 without NUL bytes and of bounded size, so every supported database can store it. */
     private function formatError(Throwable|string $error): string
     {
-        if (!$error instanceof Throwable) {
-            return $error;
-        }
-
-        return sprintf(
-            '%s: %s @ %s:%d',
-            $error::class,
-            $error->getMessage(),
-            $error->getFile(),
-            $error->getLine(),
-        );
+        $text = $error instanceof Throwable
+            ? sprintf('%s: %s @ %s:%d', $error::class, $error->getMessage(), $error->getFile(), $error->getLine())
+            : $error;
+        $text = str_replace("\0", '\0', mb_scrub($text, 'UTF-8'));
+        return strlen($text) > self::MAX_ERROR_BYTES
+            ? mb_strcut($text, 0, self::MAX_ERROR_BYTES - 3, 'UTF-8') . '...'
+            : $text;
     }
 }

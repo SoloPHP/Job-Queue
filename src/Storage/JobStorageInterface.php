@@ -4,123 +4,88 @@ declare(strict_types=1);
 
 namespace Solo\JobQueue\Storage;
 
+use DateTimeImmutable;
+use Solo\JobQueue\ClaimedJob;
+use Solo\JobQueue\JobRecord;
+use Solo\JobQueue\JobStatus;
+use Solo\JobQueue\RetryPolicy;
+
 /**
- * Internal persistence-layer contract for {@see \Solo\JobQueue\JobQueue}.
+ * Persistence used by JobQueue. Implementations apply conditional state transitions;
+ * JobQueue decides every next state. Acknowledgements are fenced by the attempt token.
  *
- * This interface is NOT part of the public package contract — it lives here,
- * not in `solophp/contracts`, on purpose. The signatures reflect our concrete
- * schema (id/name/payload columns, 'pending'/'in_progress'/'completed'/'failed'
- * statuses, retry_count semantics) and are free to change between minor
- * versions of the queue package.
- *
- * If you need an alternative backend (Redis, SQS), implement
- * `Solo\Contracts\JobQueue\JobQueueInterface` directly with whatever
- * orchestration fits that transport. Do not force-fit it into this storage
- * contract.
- *
- * All timestamps are passed in as already-formatted strings in the storage's
- * native format (UTC `Y-m-d H:i:s` for SQL backends). This contract doesn't
- * touch timezones — that's the caller's responsibility.
+ * @internal Not covered by the backward compatibility promise; it may change in any 2.x release.
  */
 interface JobStorageInterface
 {
-    /**
-     * Insert one job row. Returns the new id.
-     */
     public function insert(
         string $name,
         string $type,
-        string $payloadJson,
-        string $scheduledAt,
-        ?string $expiresAt,
+        string $payload,
+        DateTimeImmutable $scheduledAt,
+        ?DateTimeImmutable $expiresAt,
+        RetryPolicy $retryPolicy,
+        DateTimeImmutable $now,
     ): int;
 
-    /**
-     * Bulk-insert many rows. `$rows` is a list of `[name, payloadJson]` tuples;
-     * all rows share `$type / $scheduledAt / $expiresAt`. Returns the number
-     * of rows inserted.
-     *
-     * @param list<array{0: string, 1: string}> $rows
-     */
+    /** @param list<array{0: string, 1: string}> $rows Pairs of job name and payload. */
     public function insertMany(
         array $rows,
         string $type,
-        string $scheduledAt,
-        ?string $expiresAt,
+        DateTimeImmutable $scheduledAt,
+        ?DateTimeImmutable $expiresAt,
+        RetryPolicy $retryPolicy,
+        DateTimeImmutable $now,
     ): int;
 
-    /**
-     * Informational read of pending jobs ready for execution. Does not lock rows.
-     *
-     * @return array<int, array<string, mixed>>
-     */
-    public function fetchPending(int $limit, ?string $type, string $now): array;
+    /** Atomically start one attempt. No attempt may be returned to concurrent consumers. */
+    public function claim(?string $type, DateTimeImmutable $now, DateTimeImmutable $leaseUntil): ?ClaimedJob;
+
+    /** Complete, or delete, the job while this attempt's token is current. */
+    public function complete(ClaimedJob $job, DateTimeImmutable $now, bool $delete): bool;
+
+    /** Move the attempt to pending at $runAt, or to failed/expired, while its token is current. */
+    public function fail(
+        ClaimedJob $job,
+        JobStatus $status,
+        string $error,
+        DateTimeImmutable $now,
+        ?DateTimeImmutable $runAt,
+    ): bool;
+
+    /** Like fail(), but only while the attempt still holds the expired lease it was read with. */
+    public function reclaim(
+        ClaimedJob $job,
+        JobStatus $status,
+        string $error,
+        DateTimeImmutable $now,
+        ?DateTimeImmutable $runAt,
+    ): bool;
+
+    /** Extend a still-owned, unexpired lease; never shortens or revives it. */
+    public function renew(ClaimedJob $job, DateTimeImmutable $now, DateTimeImmutable $leaseUntil): bool;
+
+    /** @return list<ClaimedJob> Attempts whose lease ended at or before $now, oldest first. */
+    public function expiredLeases(DateTimeImmutable $now, int $limit): array;
+
+    /** Move pending jobs whose deadline passed to the terminal expired state. */
+    public function expirePending(DateTimeImmutable $now, string $error): int;
 
     /**
-     * Atomically claim up to $limit pending jobs: select, mark as 'in_progress',
-     * return them. Implementations must guarantee that two concurrent claims
-     * never return overlapping rows.
-     *
-     * @return list<array{id: int, name: string, payload: string}>
+     * Requeue a failed job, or a failed/expired job when a new deadline is supplied.
+     * Completed and active jobs are never revived.
      */
-    public function claim(int $limit, ?string $type, string $now): array;
+    public function retry(int $id, DateTimeImmutable $now, ?DateTimeImmutable $expiresAt): bool;
 
-    /**
-     * Permanently-failed jobs, most recent first.
-     *
-     * @return array<int, array<string, mixed>>
-     */
-    public function fetchFailed(int $limit, ?string $type): array;
+    /** @return list<JobRecord> Jobs ready to be claimed, in claim order. */
+    public function pending(int $limit, ?string $type, DateTimeImmutable $now): array;
 
-    /**
-     * Counts grouped by status. All four status keys are always present
-     * (missing statuses default to 0).
-     *
-     * @return array{pending: int, in_progress: int, completed: int, failed: int}
-     */
+    /** @return list<JobRecord> Permanently failed jobs, newest first. */
+    public function failed(int $limit, ?string $type): array;
+
+    /** @return array{pending: int, in_progress: int, completed: int, failed: int, expired: int} */
     public function countByStatus(?string $type): array;
 
-    /**
-     * Delete a job row (used when `deleteOnSuccess` is enabled).
-     */
-    public function delete(int $jobId): void;
-
-    /**
-     * Move a job to 'completed': clear locks and error.
-     */
-    public function markCompleted(int $jobId): void;
-
-    /**
-     * Read the current retry_count for a job. Returns null if the job doesn't exist.
-     */
-    public function getRetryCount(int $jobId): ?int;
-
-    /**
-     * Permanently fail a job: status='failed', record error, set retry_count.
-     */
-    public function updateToFailed(int $jobId, int $retryCount, string $error): void;
-
-    /**
-     * Return a job to 'pending'. Used both by markFailed's retry branch (with
-     * the next backoff timestamp) and retry() (with retry_count reset). Pass
-     * `requireFailedStatus: true` to make the update a no-op on non-failed jobs.
-     *
-     * @return int Number of affected rows
-     */
-    public function updateToPending(
-        int $jobId,
-        int $retryCount,
-        ?string $error,
-        string $scheduledAt,
-        bool $requireFailedStatus = false,
-    ): int;
-
-    /**
-     * Sweep stuck in_progress jobs whose locked_at is older than $staleBefore:
-     * those with retries remaining return to 'pending', the rest become 'failed'.
-     * $error is written into the error column for both buckets.
-     *
-     * @return array{requeued: int, failed: int}
-     */
-    public function reclaimStuck(int $maxRetries, string $staleBefore, string $error): array;
+    /** @param non-empty-list<JobStatus> $statuses Terminal statuses to delete. */
+    public function prune(DateTimeImmutable $finishedBefore, array $statuses): int;
 }

@@ -4,11 +4,10 @@ declare(strict_types=1);
 
 namespace Solo\JobQueue\Tests\Fixtures;
 
-use JsonSerializable;
 use Psr\Container\ContainerInterface;
-use Solo\Contracts\JobQueue\JobInterface;
+use Solo\JobQueue\PersistableJobInterface;
 
-final class SimpleJob implements JobInterface, JsonSerializable
+final class SimpleJob implements PersistableJobInterface
 {
     private ?Recorder $recorder = null;
 
